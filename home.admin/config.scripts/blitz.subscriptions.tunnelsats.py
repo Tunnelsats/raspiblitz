@@ -1580,6 +1580,47 @@ def cmd_import(deps, args, result):
     finish_with_check(deps, result, wait_until_started(deps, UNITS[impl]))
 
 
+def cmd_export(deps, args, result):
+    out_path = str(getattr(args, "out", "") or "").strip()
+    if not out_path or "\x00" in out_path:
+        raise ModuleError("E_USAGE", "usage", "invalid --out path", EXIT_USAGE)
+    if deps.root != "/" and out_path.startswith(deps.root):
+        target_path = out_path
+    elif out_path.startswith("/"):
+        target_path = deps.path(out_path)
+    else:
+        target_path = os.path.abspath(out_path)
+    if os.path.islink(target_path):
+        raise ModuleError("E_USAGE", "usage", "--out path must not be a symlink", EXIT_USAGE)
+    parent = os.path.dirname(target_path)
+    if not parent or not os.path.isdir(parent) or os.path.islink(parent):
+        raise ModuleError("E_USAGE", "usage", "parent directory of --out does not exist", EXIT_USAGE)
+    cfg = load_stored_config(deps)
+    state = load_state(deps)
+    if cfg is None:
+        raise ModuleError("E_NOT_CONFIGURED", "not_configured",
+                          "no stored WireGuard config to export", EXIT_NOT_CONFIGURED)
+    write_private(target_path, render_wg_config(cfg), mode=0o600)
+    owner_name = "admin"
+    if deps.root == "/":
+        try:
+            pw = pwd.getpwnam("admin")
+            os.chown(target_path, pw.pw_uid, pw.pw_gid)
+        except (KeyError, OSError):
+            pass
+    os.chmod(target_path, 0o600)
+    result.fields.update({
+        "exported": True,
+        "file": out_path,
+        "mode": "0600",
+        "owner": owner_name,
+        "public_key": cfg["public_key"],
+        "server_domain": (state or {}).get("server_domain") or cfg["endpoint_host"],
+        "vpn_port": cfg["vpn_port"],
+    })
+
+
+
 def finish_with_check(deps, result, wait=None):
     result.fields["ln_start_wait"] = wait
     checked = check_after_activation(deps, wait)
@@ -4617,9 +4658,13 @@ def menu_choices(deps, state, conf, found=None):
         remove = ("REMOVE", "Remove again: check the config, then start Lightning")
     choices = [("STATUS", "Subscription and tunnel status"), ("CHECK", "Connection check")]
     if not has_remove_pending:
-        choices.append(("RENEW", "Extend the current subscription"))
-        if pending_store.get("renewal"):
-            choices.append(("RESUME", "Resume pending renewal"))
+        choices.extend([
+            ("RENEW", "Extend the current subscription"),
+            ("TOPUP", "Reset monthly bandwidth usage"),
+            ("BACKUP", "Export WireGuard config (.conf) backup"),
+        ])
+        if pending_store.get("renewal") or pending_store.get("reset"):
+            choices.append(("RESUME", "Resume pending renewal or bandwidth reset"))
         if state.get("activation_pending"):
             choices.append(("ACTIVATE", "Finish activating claimed subscription"))
     if state.get("mode") == "adopted_legacy":
@@ -4703,6 +4748,44 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
     d.set_background_title("TunnelSats VPN")
     found = None
     duration_choices = [("1", "1 month"), ("3", "3 months"), ("6", "6 months"), ("12", "12 months")]
+    pay_choices = [
+        ("QR", "Show QR code and BOLT11 invoice (external wallet)"),
+        ("NODE", "Pay from this RaspiBlitz node (1% routing fee cap)"),
+    ]
+
+    def handle_invoice_payment(kind, title):
+        inv_doc = menu_run(deps, ["invoice", "--kind", kind])
+        if not inv_doc.get("invoice"):
+            d.msgbox(result_text(inv_doc), title=title, width=78, height=20)
+            return
+        amt = int(inv_doc.get("amount_sats") or 0)
+        fee_cap = max(int(math.ceil(amt * 0.01)), 10)
+        code_p, pay_tag = d.menu(
+            "Invoice amount: %d sats\nChoose how to pay:" % amt,
+            choices=pay_choices, width=70, height=12, title=title,
+        )
+        if code_p != d.OK:
+            return
+        if pay_tag == "NODE":
+            if d.yesno("Pay %d sats from this node (max routing fee %d sats)?" % (amt, fee_cap),
+                       width=64, height=10, title=title) == d.OK:
+                os.system("clear")
+                print("# TunnelSats: paying %d sats via local node ..." % amt)
+                pay_doc = menu_run(deps, ["pay-node", "--kind", kind, "--yes"])
+                if pay_doc["ok"]:
+                    d.msgbox(result_text(pay_doc), title=title, width=78, height=20)
+                    return
+                if d.yesno(result_text(pay_doc) + "\n\nShow QR code to pay with an external wallet instead?",
+                           width=78, height=18, title=title) != d.OK:
+                    return
+        os.system("clear")
+        show_qr(deps, inv_doc["invoice"])
+        print("\nBOLT11: %s\n" % inv_doc["invoice"])
+        print("# Waiting for payment (up to 5 minutes; background timer also settles automatically) ...")
+        settle_doc = menu_run(deps, ["settle", "--wait", "300"])
+        hide_qr(deps)
+        d.msgbox(result_text(settle_doc), title=title, width=78, height=20)
+
     while True:
         state = load_state(deps)
         conf = read_rb_conf(deps)
@@ -4714,7 +4797,7 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
         text = "\nTunnelSats VPN for Lightning clearnet:"
         if notice:
             text = "\n%s\n%s" % (notice, text)
-        code, tag = d.menu(text, choices=choices, width=78 if notice else 70, height=28 if notice else 16,
+        code, tag = d.menu(text, choices=choices, width=78 if notice else 70, height=28 if notice else 18,
                            title="TunnelSats", cancel_label="Back")
         if code != d.OK:
             return
@@ -4737,18 +4820,11 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
                 continue
             os.system("clear")
             print("# TunnelSats: creating subscription invoice ...")
-            doc = menu_run(deps, ["buy", "--server", server_id, "--months", months, "--pay", "qr"])
+            doc = menu_run(deps, ["buy", "--server", server_id, "--months", months, "--pay", "none"])
             if not doc["ok"]:
                 d.msgbox(result_text(doc), title="BUY", width=78, height=20)
                 continue
-            inv_doc = menu_run(deps, ["invoice", "--kind", "order"])
-            if inv_doc.get("invoice"):
-                show_qr(deps, inv_doc["invoice"])
-                print("\nBOLT11: %s\n" % inv_doc["invoice"])
-                print("# Waiting for payment (up to 5 minutes; background timer also settles automatically) ...")
-                settle_doc = menu_run(deps, ["settle", "--wait", "300"])
-                hide_qr(deps)
-                d.msgbox(result_text(settle_doc), title="BUY", width=78, height=20)
+            handle_invoice_payment("order", "BUY")
         elif tag == "RENEW":
             code, months = d.menu("Choose renewal duration:", choices=duration_choices,
                                   width=60, height=12, title="RENEW")
@@ -4756,30 +4832,36 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
                 continue
             os.system("clear")
             print("# TunnelSats: creating renewal invoice ...")
-            doc = menu_run(deps, ["renew", "--months", months, "--pay", "qr"])
+            doc = menu_run(deps, ["renew", "--months", months, "--pay", "none"])
             if not doc["ok"]:
                 d.msgbox(result_text(doc), title="RENEW", width=78, height=20)
                 continue
-            inv_doc = menu_run(deps, ["invoice", "--kind", "renewal"])
-            if inv_doc.get("invoice"):
-                show_qr(deps, inv_doc["invoice"])
-                print("\nBOLT11: %s\n" % inv_doc["invoice"])
-                print("# Waiting for payment (up to 5 minutes) ...")
-                settle_doc = menu_run(deps, ["settle", "--wait", "300"])
-                hide_qr(deps)
-                d.msgbox(result_text(settle_doc), title="RENEW", width=78, height=20)
+            handle_invoice_payment("renewal", "RENEW")
+        elif tag == "TOPUP":
+            os.system("clear")
+            print("# TunnelSats: creating bandwidth reset invoice ...")
+            doc = menu_run(deps, ["topup", "--pay", "none"])
+            if not doc["ok"]:
+                d.msgbox(result_text(doc), title="TOPUP", width=78, height=20)
+                continue
+            handle_invoice_payment("reset", "TOPUP")
+        elif tag == "BACKUP":
+            code, out_path = d.inputbox("Path to write the WireGuard config backup (0600 admin):",
+                                        init="/home/admin/tunnelsats-backup.conf",
+                                        width=70, height=10, title="BACKUP")
+            if code != d.OK or not out_path.strip():
+                continue
+            doc = menu_run(deps, ["export", "--out", out_path.strip()])
+            d.msgbox(result_text(doc), title="BACKUP", width=78, height=20)
         elif tag == "RESUME":
             pending_store = load_pending(deps)
-            kind = "order" if (pending_store.get("order") or pending_store.get("retained_orders")) else "renewal"
-            inv_doc = menu_run(deps, ["invoice", "--kind", kind])
-            if inv_doc.get("invoice"):
-                os.system("clear")
-                show_qr(deps, inv_doc["invoice"])
-                print("\nBOLT11: %s\n" % inv_doc["invoice"])
-                print("# Checking and waiting for settlement ...")
-            settle_doc = menu_run(deps, ["settle", "--wait", "300"])
-            hide_qr(deps)
-            d.msgbox(result_text(settle_doc), title="RESUME", width=78, height=20)
+            if pending_store.get("order") or pending_store.get("retained_orders"):
+                kind = "order"
+            elif pending_store.get("renewal"):
+                kind = "renewal"
+            else:
+                kind = "reset"
+            handle_invoice_payment(kind, "RESUME")
         elif tag == "ACTIVATE":
             os.system("clear")
             print("# TunnelSats: activating claimed subscription ...")
@@ -4899,9 +4981,9 @@ def status_text(doc):
 
 HANDLERS = {"menu": cmd_menu, "servers": cmd_servers, "buy": cmd_buy, "renew": cmd_renew,
             "topup": cmd_topup, "invoice": cmd_invoice, "pending": cmd_pending, "settle": cmd_settle,
-            "pay-node": cmd_pay_node, "import": cmd_import, "adopt": cmd_adopt, "status": cmd_status,
-            "check": cmd_check, "detect": cmd_detect, "repair": cmd_repair, "uninstall": cmd_uninstall,
-            "subscriptions-list": cmd_subscriptions_list, "tick": cmd_tick}
+            "pay-node": cmd_pay_node, "export": cmd_export, "import": cmd_import, "adopt": cmd_adopt,
+            "status": cmd_status, "check": cmd_check, "detect": cmd_detect, "repair": cmd_repair,
+            "uninstall": cmd_uninstall, "subscriptions-list": cmd_subscriptions_list, "tick": cmd_tick}
 
 
 class _UsageError(Exception):
@@ -4951,6 +5033,8 @@ def build_parser():
     p.add_argument("--kind", choices=("order", "renewal", "reset"))
     p.add_argument("--impl", choices=IMPLS)
     p.add_argument("--yes", action="store_true")
+    p = verb("export")
+    p.add_argument("--out", required=True)
     p = verb("import")
     p.add_argument("--file", required=True)
     p.add_argument("--impl", choices=IMPLS)

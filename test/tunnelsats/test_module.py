@@ -1844,14 +1844,14 @@ class TestMenu(ModuleTestCase):
 
     def test_start_and_restart_only_while_tunnelsats_is_on(self):
         self.fake.units["lnd.service"]["ActiveState"] = "inactive"
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE", "START"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "START"], self.tags())
         self.fake.units["lnd.service"]["ActiveState"] = "active"
         self.record(decision="tor-only", reason="emergency_block")
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE", "RESTART"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "RESTART"], self.tags())
         self.fake.conf_set("tunnelsats", "off")
         for active in ("inactive", "failed", "active"):
             self.fake.units["lnd.service"]["ActiveState"] = active
-            self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE"], self.tags())
+            self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE"], self.tags())
 
     def test_menu_start_only_while_tunnelsats_is_on(self):
         self.fake.conf_set("tunnelsats", "off")
@@ -1876,15 +1876,17 @@ class TestMenu(ModuleTestCase):
     def test_adopted_legacy_offers_upgrade(self):
         shutil.rmtree(self.path(mod.STATE_DIR))
         self.store(mode="adopted_legacy")
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
         state = mod.load_state(self.deps)
         state["activation_pending"] = True
         mod.save_state(self.deps, state)
         pending = mod.empty_pending()
         pending["renewal"] = {"renewal_id": "ren-1", "payment_hash": "b" * 64, "state": "awaiting_payment"}
         mod.save_pending(self.deps, pending)
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "RESUME", "ACTIVATE", "UPGRADE", "REPAIR", "REMOVE"],
-                         self.tags())
+        self.assertEqual(
+            ["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "RESUME", "ACTIVATE", "UPGRADE", "REPAIR", "REMOVE"],
+            self.tags(),
+        )
 
 
 class TestAdopt(ModuleTestCase):
@@ -3282,6 +3284,54 @@ class TestPayNode(ModuleTestCase):
         self.assertIsNone(mod.load_pending(self.deps)["reset"])
 
 
+# ------------------------------------------------------------------------------------------
+# export (BACKUP) and P4 menu flows (P4 Commit 3)
+# ------------------------------------------------------------------------------------------
+
+class TestExportAndMenuP4(ModuleTestCase):
+    def test_export_and_import_dry_run_round_trip_tc22(self):
+        os.makedirs(self.path("/home/admin"), exist_ok=True)
+        out_file = self.path("/home/admin/ts-backup.conf")
+        # Unconfigured node refuses export
+        doc_unconf = self.run_verb("export", "--out", out_file)
+        self.assertEqual((3, "E_NOT_CONFIGURED"), (doc_unconf["exit_code"], doc_unconf["error"]))
+
+        self.store()
+        # Missing parent directory is refused with E_USAGE
+        doc_noparent = self.run_verb("export", "--out", self.path("/nonexistent/dir/ts-backup.conf"))
+        self.assertEqual((2, "E_USAGE"), (doc_noparent["exit_code"], doc_noparent["error"]))
+
+        # Symlink target is refused with E_USAGE
+        sym_path = self.path("/home/admin/sym-backup.conf")
+        os.symlink(out_file, sym_path)
+        doc_sym = self.run_verb("export", "--out", sym_path)
+        self.assertEqual((2, "E_USAGE"), (doc_sym["exit_code"], doc_sym["error"]))
+
+        # Valid export writes 0600 canonical config and leaks no key material in JSON
+        doc_exp = self.run_verb("export", "--out", out_file)
+        self.assertEqual((0, True, out_file, "0600", "admin", ALICE_PUB, 24556),
+                         (doc_exp["exit_code"], doc_exp["exported"], doc_exp["file"],
+                          doc_exp["mode"], doc_exp["owner"], doc_exp["public_key"], doc_exp["vpn_port"]))
+        self.assertNotIn(ALICE_PRIV, json.dumps(doc_exp))
+        st = os.stat(out_file)
+        self.assertEqual(0o600, st.st_mode & 0o777)
+
+        # TC-22: import --file <exported> --dry-run round-trips cleanly
+        doc_imp = self.run_verb("import", "--file", out_file, "--dry-run")
+        self.assertEqual((0, True, True, ALICE_PUB),
+                         (doc_imp["exit_code"], doc_imp["valid"], doc_imp["dry_run"], doc_imp["public_key"]))
+
+        # Pending reset offers RESUME in menu_choices
+        pending = mod.empty_pending()
+        pending["reset"] = {"reset_id": "rst-m", "payment_hash": "e" * 64, "state": "awaiting_payment"}
+        mod.save_pending(self.deps, pending)
+        tags = [tag for tag, _ in mod.menu_choices(self.deps, mod.load_state(self.deps), mod.read_rb_conf(self.deps))[0]]
+        self.assertIn("RESUME", tags)
+        self.assertIn("TOPUP", tags)
+        self.assertIn("BACKUP", tags)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
