@@ -2979,5 +2979,122 @@ class TestNotificationsAndTickHooks(ModuleTestCase):
         self.assertEqual(9.5, mod.load_state(self.deps)["api"]["data"]["bandwidth_used_gb"])
 
 
+# ------------------------------------------------------------------------------------------
+# topup (bandwidth reset) and reset settlement (P4 Commit 1)
+# ------------------------------------------------------------------------------------------
+
+class TestTopupAndResetSettle(ModuleTestCase):
+    def test_topup_creates_reuses_and_handles_reset_limit(self):
+        # Unconfigured node refuses topup
+        doc_unconf = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((3, "E_NOT_CONFIGURED"), (doc_unconf["exit_code"], doc_unconf["error"]))
+
+        self.store()
+        ph = "b" * 64
+        inv = make_bolt11("lnbc50u", payment_hash=ph, expiry=900)
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "resetId": "rst-1", "paymentHash": ph, "invoice": inv, "amountSats": 5000,
+            "expiresAt": "2026-10-14T12:15:00Z",
+        }).encode())]
+        doc1 = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((0, "awaiting_payment", False, "rst-1", ph, 5000, "de2"),
+                         (doc1["exit_code"], doc1["state"], doc1["reused"], doc1["reset_id"],
+                          doc1["payment_hash"], doc1["amount_sats"], doc1["server_id"]))
+        self.assertEqual({"wgPublicKey": ALICE_PUB, "serverId": "de2"}, self.fake.http_calls[-1][1])
+        self.assertIn([mod.ITS, "tick-timer", "on"], self.fake.calls)
+
+        # Second topup while invoice is unexpired polls reset status (pending) and reuses same invoice (TC-21)
+        self.fake.http_calls.clear()
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode())]
+        doc2 = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((0, True, ph), (doc2["exit_code"], doc2["reused"], doc2["payment_hash"]))
+        self.assertEqual([(mod.API_SUBSCRIPTION_URL + "/" + ph, None)], self.fake.http_calls)
+
+        # If poll during reuse shows paid/processing, refuses with E_ORDER_PENDING and marks reset paid
+        self.fake.http_responses = [(202, {}, json.dumps({"status": "processing", "type": "bandwidth_reset"}).encode())]
+        doc_paid = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((14, "E_ORDER_PENDING"), (doc_paid["exit_code"], doc_paid["error"]))
+        self.assertEqual("paid", mod.load_pending(self.deps)["reset"]["state"])
+
+        # Clear pending reset and test 429 monthly reset limit vs generic 429 rate limit
+        mod.save_pending(self.deps, mod.empty_pending())
+        self.fake.http_responses = [(429, {}, b'{"message": "Maximum 2 resets per month reached"}')]
+        doc_lim = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((14, "E_RESET_LIMIT"), (doc_lim["exit_code"], doc_lim["error"]))
+
+        self.fake.http_responses = [(429, {}, b'{"message": "Too many requests"}')]
+        doc_rl = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((13, "E_RATE_LIMITED"), (doc_rl["exit_code"], doc_rl["error"]))
+
+    def test_settle_reset_confirms_and_clears_bandwidth_notifications(self):
+        self.store()
+        self.activate_conf()
+        state = mod.load_state(self.deps)
+        state["notify_state"] = {
+            "expiry_cycle": "2026-12-01T00:00:00.000Z",
+            "bandwidth_cycle": "2026-12-01T00:00:00.000Z:0",
+            "verdict_seq": 0,
+            "last_verdict": "protected",
+            "verdict_warning_handed_off": False,
+            "daily": {"date": "2026-10-14", "count": 0},
+            "events": {
+                "bandwidth_high": {"cycle": "2026-12-01T00:00:00.000Z:0", "attempts": 1, "outcome": "handed_off"},
+                "bandwidth_exhausted": {"cycle": "2026-12-01T00:00:00.000Z:0", "attempts": 1, "outcome": "handed_off"},
+            },
+        }
+        mod.save_state(self.deps, state)
+
+        ph = "c" * 64
+        pending = mod.empty_pending()
+        pending["reset"] = {
+            "reset_id": "rst-c", "payment_hash": ph, "invoice": make_bolt11("lnbc50u", payment_hash=ph),
+            "amount_sats": 5000, "server_id": "de2", "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T12:15:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": "awaiting_payment",
+            "old_resets": 0, "old_used_gb": 85.0,
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+
+        reset_status = dict(fixture_json("api", "status_enabled.json"),
+                            bandwidth_used_gb=0.0, bandwidth_resets_this_month=1)
+        # Pass 1: 202 processing -> waits 5s; Pass 2: 200 paid + api_status -> confirmed
+        self.fake.http_responses = [
+            (202, {}, json.dumps({"status": "processing", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps({"status": "paid", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps(reset_status).encode()),
+        ]
+        self.fake.calls.clear()
+        doc = self.run_verb("settle", "--wait", "10")
+        self.assertEqual((0, "reset", "confirmed", 0.0, 1, [5]),
+                         (doc["exit_code"], doc["kind"], doc["state"], doc["bandwidth_used_gb"],
+                          doc["resets_this_month"], self.fake.sleeps))
+        self.assertIsNone(mod.load_pending(self.deps)["reset"])
+        new_state = mod.load_state(self.deps)
+        self.assertEqual(1, new_state["api"]["data"]["resets_this_month"])
+        self.assertEqual({}, new_state["notify_state"]["events"])
+        self.assertEqual([], [c for c in self.fake.calls if c[0] in ("systemctl", mod.ITS)])
+
+    def test_settle_reset_server_failure_marks_needs_support(self):
+        self.store()
+        ph = "d" * 64
+        pending = mod.empty_pending()
+        pending["reset"] = {
+            "reset_id": "rst-d", "payment_hash": ph, "invoice": make_bolt11("lnbc50u", payment_hash=ph),
+            "amount_sats": 5000, "server_id": "de2", "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T12:15:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": "paid",
+            "old_resets": 0, "old_used_gb": 90.0,
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "failed", "type": "bandwidth_reset"}).encode()),
+        ]
+        doc = self.run_verb("settle")
+        self.assertEqual((12, "E_RESET_FAILED"), (doc["exit_code"], doc["error"]))
+        self.assertEqual("needs_support", mod.load_pending(self.deps)["reset"]["state"])
+
+
 if __name__ == "__main__":
     unittest.main()
