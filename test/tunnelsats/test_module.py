@@ -2568,5 +2568,262 @@ class TestServers(ModuleTestCase):
                          (doc4["stale"], doc4["offline_list"], len(doc4["servers"])))
 
 
+# ------------------------------------------------------------------------------------------
+# buy, renew, invoice, pending, claim trust boundary, and settle (P3 Commit 2)
+# ------------------------------------------------------------------------------------------
+
+class TestBuyAndRenew(ModuleTestCase):
+    def test_buy_creates_reuses_and_supersedes_orders(self):
+        ph1 = "1" * 64
+        inv1 = make_bolt11("lnbc250u", payment_hash=ph1, expiry=3600)
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "orderId": "ord-101", "paymentHash": ph1, "invoice": inv1, "amountSats": 25000,
+        }).encode())]
+        doc1 = self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")
+        self.assertEqual((0, "awaiting_payment", False, 25000, ph1),
+                         (doc1["exit_code"], doc1["state"], doc1["reused"], doc1["amount_sats"], doc1["payment_hash"]))
+        self.assertEqual({"match": True, "invoice_sats": 25000, "api_sats": 25000}, doc1["amount_check"])
+        self.assertIn([mod.ITS, "tick-timer", "on"], self.fake.calls)
+
+        # Same server + months while unexpired: reuses order without new HTTP call
+        self.fake.http_calls.clear()
+        doc_reuse = self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")
+        self.assertEqual((0, True, ph1, []),
+                         (doc_reuse["exit_code"], doc_reuse["reused"], doc_reuse["payment_hash"], self.fake.http_calls))
+
+        # Different months: polls old order first (pending), moves it to retained_orders as superseded
+        ph2 = "2" * 64
+        inv2 = make_bolt11("lnbc600u", payment_hash=ph2, expiry=3600)
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "pending"}).encode()),
+            (200, {}, json.dumps({"orderId": "ord-102", "paymentHash": ph2, "invoice": inv2, "amountSats": 60000}).encode()),
+        ]
+        doc2 = self.run_verb("buy", "--server", "eu-de", "--months", "3", "--pay", "none")
+        self.assertEqual((0, False, ph2), (doc2["exit_code"], doc2["reused"], doc2["payment_hash"]))
+        pending = mod.load_pending(self.deps)
+        self.assertEqual(1, len(pending["retained_orders"]))
+        self.assertEqual(("ord-101", "superseded"), (pending["retained_orders"][0]["order_id"], pending["retained_orders"][0]["state"]))
+
+        # If poll during supersede shows old order was paid, refuses with E_ORDER_PENDING and marks it paid
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "paid"}).encode())]
+        doc_paid = self.run_verb("buy", "--server", "us-east", "--months", "6", "--pay", "none")
+        self.assertEqual((14, "E_ORDER_PENDING"), (doc_paid["exit_code"], doc_paid["error"]))
+        self.assertEqual("paid", mod.load_pending(self.deps)["order"]["state"])
+
+    def test_buy_refusals(self):
+        # --pay node is unsupported in P3
+        doc = self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "node")
+        self.assertEqual((14, "E_PAY_UNSUPPORTED"), (doc["exit_code"], doc["error"]))
+        # Invalid server ID
+        doc = self.run_verb("buy", "--server", "BAD_SERVER!", "--months", "1", "--pay", "none")
+        self.assertEqual((2, "E_USAGE"), (doc["exit_code"], doc["error"]))
+        # Invoice amount mismatch
+        ph = "3" * 64
+        inv = make_bolt11("lnbc250u", payment_hash=ph)
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "orderId": "ord-bad", "paymentHash": ph, "invoice": inv, "amountSats": 99999,
+        }).encode())]
+        doc = self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")
+        self.assertEqual((12, "E_INVOICE_MISMATCH"), (doc["exit_code"], doc["error"]))
+        self.assertIsNone(mod.load_pending(self.deps)["order"])
+        # Already configured
+        self.store()
+        doc = self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")
+        self.assertEqual((14, "E_ALREADY_CONFIGURED"), (doc["exit_code"], doc["error"]))
+
+    def test_renew_creates_and_reuses_renewal(self):
+        # Unconfigured node refuses renew
+        self.assertEqual((3, "E_NOT_CONFIGURED"),
+                         tuple([(d["exit_code"], d["error"]) for d in [self.run_verb("renew", "--months", "1", "--pay", "none")]][0]))
+        self.store()
+        ph = "4" * 64
+        inv = make_bolt11("lnbc250u", payment_hash=ph, expiry=3600)
+        # Renew allows omitted amountSats as long as BOLT11 is <= MAX_RENEW_SATS
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "renewalId": "ren-1", "paymentHash": ph, "invoice": inv,
+        }).encode())]
+        doc = self.run_verb("renew", "--months", "1", "--pay", "none")
+        self.assertEqual((0, "awaiting_payment", False, "de2", 25000, "2026-12-01T00:00:00.000Z"),
+                         (doc["exit_code"], doc["state"], doc["reused"], doc["server_id"], doc["amount_sats"], doc["old_expiry"]))
+        self.assertEqual("2026-12-31T00:00:00Z", doc["new_expiry"])
+        self.assertEqual({"serverId": "de2", "duration": 1, "wgPublicKey": ALICE_PUB}, self.fake.http_calls[-1][1])
+
+        # Reuses unexpired renewal for same months
+        self.fake.http_calls.clear()
+        doc2 = self.run_verb("renew", "--months", "1", "--pay", "none")
+        self.assertEqual((0, True, []), (doc2["exit_code"], doc2["reused"], self.fake.http_calls))
+
+
+class TestInvoiceAndPending(ModuleTestCase):
+    def test_invoice_qr_png_expiry_and_pending_redaction(self):
+        self.assertEqual("E_NO_PENDING", self.run_verb("invoice", "--kind", "order")["error"])
+        ph = "5" * 64
+        inv = make_bolt11("lnbc250u", payment_hash=ph, expiry=900)
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "orderId": "ord-5", "paymentHash": ph, "invoice": inv, "amountSats": 25000,
+        }).encode())]
+        self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")
+        qr_path = os.path.join(self.root, "invoice.png")
+        doc_inv = self.run_verb("invoice", "--kind", "order", "--qr-png", qr_path)
+        self.assertEqual((0, inv, qr_path), (doc_inv["exit_code"], doc_inv["invoice"], doc_inv["qr_png"]))
+        self.assertTrue(os.path.isfile(qr_path))
+        self.assertIn(["qrencode", "-o", qr_path, "-s", "6", "-m", "2", inv.upper()], self.fake.calls)
+
+        # Pending redacts private_key and invoice
+        doc_pend = self.run_verb("pending")
+        self.assertEqual("awaiting_payment", doc_pend["order"]["state"])
+        self.assertNotIn("private_key", doc_pend["order"])
+        self.assertNotIn("invoice", doc_pend["order"])
+        self.assertTrue(doc_pend["order"]["has_private_key"])
+
+        # Advance clock past 900s invoice expiry: pending marks expired_unpaid, invoice refuses with E_INVOICE_EXPIRED
+        self.deps.clock = lambda: NOW + datetime.timedelta(seconds=1200)
+        doc_pend2 = self.run_verb("pending")
+        self.assertEqual("expired_unpaid", doc_pend2["order"]["state"])
+        doc_exp = self.run_verb("invoice", "--kind", "order")
+        self.assertEqual((14, "E_INVOICE_EXPIRED"), (doc_exp["exit_code"], doc_exp["error"]))
+
+
+class TestClaimAndSettle(ModuleTestCase):
+    def valid_claim_doc(self, pub=ALICE_PUB):
+        return {
+            "peer": {
+                "publicKey": pub,
+                "ip": "10.9.0.42/32",
+                "presharedKey": BOB_PUB,
+                "vpnPort": 24556,
+            },
+            "server": {
+                "publicKey": BOB_PUB,
+                "endpoint": "de2.tunnelsats.com:51820",
+                "allowedIPs": "0.0.0.0/0",
+                "persistentKeepalive": 25,
+            },
+            "subscriptionEnd": "2026-12-01T00:00:00Z",
+            "fullConfig": "[Interface]\nPrivateKey = EVIL_SERVER_KEY\n",
+        }
+
+    def test_assemble_claimed_config_trust_boundary(self):
+        cfg = mod.assemble_claimed_config(self.valid_claim_doc(), ALICE_PRIV, ALICE_PUB)
+        self.assertEqual((ALICE_PRIV, ALICE_PUB, "de2.tunnelsats.com", 24556, "2026-12-01T00:00:00Z"),
+                         (cfg["private_key"], cfg["public_key"], cfg["endpoint_host"], cfg["vpn_port"], cfg["valid_until"]))
+
+        # Rejects mismatched peer.publicKey, bad IP, non-tunnelsats host, missing 0.0.0.0/0, bad port
+        bad_cases = [
+            {"peer": dict(self.valid_claim_doc()["peer"], publicKey=BOB_PUB)},
+            {"peer": dict(self.valid_claim_doc()["peer"], ip="192.168.1.1/32")},
+            {"peer": dict(self.valid_claim_doc()["peer"], ip="10.9.0.0/24")},
+            {"peer": dict(self.valid_claim_doc()["peer"], vpnPort=70000)},
+            {"server": dict(self.valid_claim_doc()["server"], endpoint="evil.example.com:51820")},
+            {"server": dict(self.valid_claim_doc()["server"], allowedIPs="10.0.0.0/8")},
+            {"subscriptionEnd": "not-a-date"},
+        ]
+        for patch in bad_cases:
+            doc = dict(self.valid_claim_doc(), **patch)
+            with self.assertRaises(mod.ModuleError) as ctx:
+                mod.assemble_claimed_config(doc, ALICE_PRIV, ALICE_PUB)
+            self.assertEqual("E_CLAIM_INVALID", ctx.exception.code, patch)
+
+    def test_settle_order_polls_claims_and_activates(self):
+        self.record()
+        ph = "6" * 64
+        order = {
+            "order_id": "ord-6",
+            "payment_hash": ph,
+            "invoice": make_bolt11("lnbc250u", payment_hash=ph),
+            "amount_sats": 25000,
+            "server_id": "de2",
+            "months": 1,
+            "impl": "lnd",
+            "private_key": ALICE_PRIV,
+            "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z",
+            "invoice_expires_at": "2026-10-14T13:00:00Z",
+            "retained_until": "2026-10-15T12:00:00Z",
+            "state": "awaiting_payment",
+            "node_payment": {"state": "none", "result": None},
+        }
+        pending = mod.empty_pending()
+        pending["order"] = order
+        mod.save_pending(self.deps, pending)
+
+        # First poll: pending; second poll (after 5s sleep): paid; then claim (200); then api_status (200)
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "pending"}).encode()),
+            (200, {}, json.dumps({"status": "paid"}).encode()),
+            (200, {}, json.dumps(self.valid_claim_doc()).encode()),
+            (200, {}, fixture("api", "status_enabled.json").encode()),
+        ]
+        doc = self.run_verb("settle", "--wait", "10")
+        self.assertEqual((0, "active", "protected", [5]),
+                         (doc["exit_code"], doc["state"], doc["verdict"], self.fake.sleeps))
+        self.assertIsNone(mod.load_pending(self.deps)["order"])
+        with open(self.path(mod.PENDING_FILE), "rb") as handle:
+            self.assertNotIn(ALICE_PRIV.encode(), handle.read())
+        self.assertEqual(ALICE_PUB, mod.load_state(self.deps)["public_key"])
+
+    def test_settle_claim_409_marks_needs_support(self):
+        ph = "7" * 64
+        pending = mod.empty_pending()
+        pending["order"] = {
+            "order_id": "ord-7", "payment_hash": ph, "private_key": ALICE_PRIV, "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T13:00:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": "paid",
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [(409, {}, b'{"error": "ERR_ALREADY_CLAIMED"}')]
+        doc = self.run_verb("settle")
+        self.assertEqual((12, "E_CLAIM_CONFLICT"), (doc["exit_code"], doc["error"]))
+        saved = mod.load_pending(self.deps)["order"]
+        self.assertEqual("needs_support", saved["state"])
+
+    def test_settle_renewal_confirms_without_restarting_tunnel_or_lightning(self):
+        self.store()
+        self.activate_conf()
+        ph = "8" * 64
+        pending = mod.empty_pending()
+        pending["renewal"] = {
+            "renewal_id": "ren-8", "payment_hash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph),
+            "amount_sats": 25000, "server_id": "de2", "months": 1,
+            "old_expiry": "2026-12-01T00:00:00Z", "new_expiry": "2027-01-01T00:00:00Z",
+            "public_key": ALICE_PUB, "created_at": "2026-10-14T12:00:00Z",
+            "invoice_expires_at": "2026-10-14T13:00:00Z", "retained_until": "2026-10-15T12:00:00Z",
+            "state": "awaiting_payment", "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+        renewed_status = dict(fixture_json("api", "status_enabled.json"), expiry="2027-01-01T00:00:00Z")
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "paid"}).encode()),
+            (200, {}, json.dumps(renewed_status).encode()),
+        ]
+        self.fake.calls.clear()
+        doc = self.run_verb("settle", "--wait", "5")
+        self.assertEqual((0, "confirmed", "2027-01-01T00:00:00Z"),
+                         (doc["exit_code"], doc["state"], doc["new_expiry"]))
+        self.assertIsNone(mod.load_pending(self.deps)["renewal"])
+        self.assertEqual("2027-01-01T00:00:00Z", mod.load_state(self.deps)["valid_until"])
+        self.assertEqual("2027-01-01T00:00:00Z", mod.load_stored_config(self.deps)["valid_until"])
+        # No systemctl or internet.tunnelsats.sh install/restart calls during renewal!
+        self.assertEqual([], [c for c in self.fake.calls if c[0] in ("systemctl", mod.ITS)])
+
+    def test_settle_timeout_returns_exit_11(self):
+        ph = "9" * 64
+        pending = mod.empty_pending()
+        pending["order"] = {
+            "order_id": "ord-9", "payment_hash": ph, "private_key": ALICE_PRIV, "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T13:00:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": "awaiting_payment",
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "pending"}).encode()),
+            (200, {}, json.dumps({"status": "pending"}).encode()),
+        ]
+        doc = self.run_verb("settle", "--wait", "3")
+        self.assertEqual((11, "awaiting_payment", [3]), (doc["exit_code"], doc["state"], self.fake.sleeps))
+
+
 if __name__ == "__main__":
     unittest.main()
