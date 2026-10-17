@@ -131,6 +131,12 @@ class FakeSystem:
         }
         # LND resolves externalhosts and announces the resolved address (1.2.3.4 = endpoint.ipv4)
         self.getinfo = {"uris": ["0280a@1.2.3.4:24556", "0280a@exampleonion.onion:9735"]}
+        self.lnd_listpayments = (0, {"payments": []})
+        self.lnd_decodepayreq = None
+        self.lnd_payinvoice = (1, {}, "unable to find a path to destination")
+        self.cln_listpays = (0, {"pays": []})
+        self.cln_decode = None
+        self.cln_pay = (1, {"code": 205, "message": "Could not find a route"}, "")
         self.wg = {"latest-handshakes": "%s\t%d\n" % (BOB_PUB, int(NOW.timestamp()) - 30),
                    "transfer": "%s\t1000\t2000\n" % BOB_PUB}
 
@@ -140,6 +146,17 @@ class FakeSystem:
         if tokens and tokens[0] in ("install", "adopt", "guard"):
             return tokens[0]
         return " ".join(tokens)
+
+    def _pop_scripted(self, attr_name):
+        val = getattr(self, attr_name)
+        if isinstance(val, list):
+            val = val.pop(0) if len(val) > 1 else val[0]
+        if callable(val):
+            val = val()
+        rc, doc = val[0], val[1]
+        err = val[2] if len(val) > 2 else ""
+        out = doc if isinstance(doc, str) else json.dumps(doc)
+        return rc, out, err
 
     def run(self, argv, timeout=60, interactive=False):
         self.calls.append(list(argv))
@@ -220,6 +237,24 @@ class FakeSystem:
                     gone = argv[argv.index("--address_remove") + 1]
                     self.getinfo["uris"] = [u for u in self.getinfo["uris"] if not u.endswith("@" + gone)]
                 return self.announce_rc, "{}" if self.announce_rc == 0 else "", "" if self.announce_rc == 0 else "rpc error"
+            if "listpayments" in argv:
+                return self._pop_scripted("lnd_listpayments")
+            if "decodepayreq" in argv:
+                if self.lnd_decodepayreq is not None:
+                    return self._pop_scripted("lnd_decodepayreq")
+                inv_dec = mod.decode_bolt11(argv[-1])
+                return 0, json.dumps({"payment_hash": inv_dec["payment_hash"], "num_satoshis": str(inv_dec["amount_sats"])}), ""
+            if "payinvoice" in argv:
+                return self._pop_scripted("lnd_payinvoice")
+            if "listpays" in argv:
+                return self._pop_scripted("cln_listpays")
+            if "decode" in argv:
+                if self.cln_decode is not None:
+                    return self._pop_scripted("cln_decode")
+                inv_dec = mod.decode_bolt11(argv[-1])
+                return 0, json.dumps({"payment_hash": inv_dec["payment_hash"], "amount_msat": "%dmsat" % (inv_dec["amount_sats"] * 1000)}), ""
+            if "pay" in argv and "-k" in argv:
+                return self._pop_scripted("cln_pay")
             return (0, json.dumps(self.getinfo), "") if self.getinfo is not None else (1, "", "locked")
         if prog == mod.NOTIFY:
             return self.notify_rc, "", ""
@@ -2624,9 +2659,9 @@ class TestBuyAndRenew(ModuleTestCase):
         self.assertEqual("paid", mod.load_pending(self.deps)["order"]["state"])
 
     def test_buy_refusals(self):
-        # --pay node is unsupported in P3
+        # --pay node without --yes requires confirmation
         doc = self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "node")
-        self.assertEqual((14, "E_PAY_UNSUPPORTED"), (doc["exit_code"], doc["error"]))
+        self.assertEqual((2, "E_CONFIRMATION_REQUIRED"), (doc["exit_code"], doc["error"]))
         # Invalid server ID
         doc = self.run_verb("buy", "--server", "BAD_SERVER!", "--months", "1", "--pay", "none")
         self.assertEqual((2, "E_USAGE"), (doc["exit_code"], doc["error"]))
@@ -3096,5 +3131,157 @@ class TestTopupAndResetSettle(ModuleTestCase):
         self.assertEqual("needs_support", mod.load_pending(self.deps)["reset"]["state"])
 
 
+# ------------------------------------------------------------------------------------------
+# pay-node (LND and CLN node payment with preflight and 1% fee cap, P4 Commit 2)
+# ------------------------------------------------------------------------------------------
+
+class TestPayNode(ModuleTestCase):
+    PREIMAGE_1 = "11" * 32
+    HASH_1 = hashlib.sha256(bytes.fromhex(PREIMAGE_1)).hexdigest()
+    PREIMAGE_2 = "22" * 32
+    HASH_2 = hashlib.sha256(bytes.fromhex(PREIMAGE_2)).hexdigest()
+
+    def valid_claim_doc(self, pub=ALICE_PUB):
+        return {
+            "peer": {"publicKey": pub, "ip": "10.9.0.42/32", "presharedKey": BOB_PUB, "vpnPort": 24556},
+            "server": {"publicKey": BOB_PUB, "endpoint": "de2.tunnelsats.com:51820", "allowedIPs": "0.0.0.0/0", "persistentKeepalive": 25},
+            "subscriptionEnd": "2026-12-01T00:00:00Z",
+        }
+
+    def test_lnd_pay_node_preflight_errors_and_success(self):
+        self.record()
+        # pay-node without --yes requires confirmation
+        self.assertEqual((2, "E_CONFIRMATION_REQUIRED"),
+                         (self.run_verb("pay-node")["exit_code"], self.run_verb("pay-node")["error"]))
+        # pay-node with no pending item returns E_NO_PENDING
+        self.assertEqual((3, "E_NO_PENDING"),
+                         (self.run_verb("pay-node", "--yes")["exit_code"], self.run_verb("pay-node", "--yes")["error"]))
+
+        inv = make_bolt11("lnbc250u", payment_hash=self.HASH_1, expiry=3600)
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "orderId": "ord-pay1", "paymentHash": self.HASH_1, "invoice": inv, "amountSats": 25000,
+        }).encode())]
+        self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")
+
+        # 1. Wallet locked (listpayments rc != 0) -> E_PAY_NODE_LOCKED (exit 10), order stays awaiting_payment
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+        self.fake.lnd_listpayments = (1, "", "wallet locked")
+        doc_lock = self.run_verb("pay-node", "--yes")
+        self.assertEqual((10, "E_PAY_NODE_LOCKED"), (doc_lock["exit_code"], doc_lock["error"]))
+        self.assertEqual("awaiting_payment", mod.load_pending(self.deps)["order"]["state"])
+
+        # 2. decodepayreq amount mismatch -> E_INVOICE_MISMATCH (exit 12), payinvoice never called
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+        self.fake.lnd_listpayments = (0, {"payments": []})
+        self.fake.lnd_decodepayreq = (0, {"payment_hash": self.HASH_1, "num_satoshis": "99000"})
+        doc_mis = self.run_verb("pay-node", "--yes")
+        self.assertEqual((12, "E_INVOICE_MISMATCH"), (doc_mis["exit_code"], doc_mis["error"]))
+        self.assertEqual([], [c for c in self.fake.calls if "payinvoice" in c])
+        self.fake.lnd_decodepayreq = None
+
+        # 3. Unfunded / no route / insufficient balance mappings (exit 10), invoice stays retryable
+        for reason_str, expected_code in (
+            ("FAILURE_REASON_NO_ROUTE", "E_PAY_NO_ROUTE"),
+            ("FAILURE_REASON_INSUFFICIENT_BALANCE", "E_PAY_INSUFFICIENT_BALANCE"),
+        ):
+            self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+            self.fake.lnd_listpayments = (0, {"payments": []})
+            self.fake.lnd_payinvoice = (1, {"status": "FAILED", "failure_reason": reason_str}, "")
+            doc_err = self.run_verb("pay-node", "--yes")
+            self.assertEqual((10, expected_code, 250),
+                             (doc_err["exit_code"], doc_err["error"], doc_err["fee_limit_sats"]))
+            self.assertEqual("awaiting_payment", mod.load_pending(self.deps)["order"]["state"])
+            self.assertEqual("failed", mod.load_pending(self.deps)["order"]["node_payment"]["state"])
+
+        # 4. Already paid in LND listpayments -> E_ALREADY_PAID (exit 14), marks order paid without calling payinvoice
+        self.fake.calls.clear()
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+        self.fake.lnd_listpayments = (0, {"payments": [{"payment_hash": self.HASH_1, "status": "SUCCEEDED"}]})
+        doc_dup = self.run_verb("pay-node", "--yes")
+        self.assertEqual((14, "E_ALREADY_PAID"), (doc_dup["exit_code"], doc_dup["error"]))
+        self.assertEqual([], [c for c in self.fake.calls if "payinvoice" in c])
+        self.assertEqual("paid", mod.load_pending(self.deps)["order"]["state"])
+
+        # Reset order to awaiting_payment and test full LND payinvoice -> preimage verification -> claim -> active
+        pending = mod.load_pending(self.deps)
+        order_pub = pending["order"]["public_key"]
+        pending["order"]["state"] = "awaiting_payment"
+        pending["order"]["node_payment"] = {"state": "none", "result": None}
+        mod.save_pending(self.deps, pending)
+        self.fake.lnd_listpayments = (0, {"payments": []})
+        self.fake.lnd_payinvoice = (0, {
+            "status": "SUCCEEDED",
+            "payment_preimage": self.PREIMAGE_1,
+            "payment_hash": self.HASH_1,
+            "fee_sat": "12",
+        }, "")
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "pending"}).encode()),
+            (200, {}, json.dumps(self.valid_claim_doc(pub=order_pub)).encode()),
+            (200, {}, fixture("api", "status_enabled.json").encode()),
+        ]
+        doc_ok = self.run_verb("pay-node", "--yes")
+        self.assertEqual((0, "order", "active", "protected", 250),
+                         (doc_ok["exit_code"], doc_ok["kind"], doc_ok["state"], doc_ok["verdict"], doc_ok["fee_limit_sats"]))
+        self.assertEqual(("succeeded", 12, True),
+                         (doc_ok["node_payment"]["state"], doc_ok["node_payment"]["fee_sats"],
+                          doc_ok["node_payment"]["preimage_verified"]))
+        self.assertIn(
+            mod.LNCLI + ["payinvoice", "--force", "--json", "--timeout", "60s", "--fee_limit", "250", "--pay_req", inv],
+            self.fake.calls,
+        )
+        self.assertIsNone(mod.load_pending(self.deps)["order"])
+
+    def test_cln_topup_pay_node_and_error_mappings(self):
+        self.store(impl="cl")
+        self.activate_conf(impl="cl")
+        inv = make_bolt11("lnbc50u", payment_hash=self.HASH_2, expiry=900)
+
+        # CLN code 205 (no route) during topup --pay node --yes -> creates reset invoice, fails payment with E_PAY_NO_ROUTE
+        self.fake.http_responses = [
+            (200, {}, json.dumps({
+                "resetId": "rst-cln", "paymentHash": self.HASH_2, "invoice": inv, "amountSats": 5000,
+            }).encode()),
+            (200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode()),
+        ]
+        self.fake.cln_listpays = (0, {"pays": []})
+        self.fake.cln_pay = (1, {"code": 205, "message": "Could not find a route"}, "")
+        doc_nr = self.run_verb("topup", "--pay", "node", "--yes")
+        self.assertEqual((10, "E_PAY_NO_ROUTE", 50),
+                         (doc_nr["exit_code"], doc_nr["error"], doc_nr["fee_limit_sats"]))
+        self.assertIn(
+            mod.CLNCLI + ["-k", "pay", "bolt11=" + inv, "maxfee=50000msat", "retry_for=60"],
+            self.fake.calls,
+        )
+
+        # CLN insufficient funds -> E_PAY_INSUFFICIENT_BALANCE
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode())]
+        self.fake.cln_pay = (1, {"code": -32602, "message": "Could not afford 5000000msat: insufficient funds"}, "")
+        doc_ib = self.run_verb("pay-node", "--kind", "reset", "--impl", "cl", "--yes")
+        self.assertEqual((10, "E_PAY_INSUFFICIENT_BALANCE"), (doc_ib["exit_code"], doc_ib["error"]))
+
+        # CLN payment succeeds -> verifies preimage -> settles bandwidth reset
+        reset_status = dict(fixture_json("api", "status_enabled.json"),
+                            bandwidth_used_gb=0.0, bandwidth_resets_this_month=1)
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps({"status": "paid", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps(reset_status).encode()),
+        ]
+        self.fake.cln_pay = (0, {
+            "status": "complete",
+            "payment_preimage": self.PREIMAGE_2,
+            "payment_hash": self.HASH_2,
+            "amount_msat": "5000000msat",
+            "amount_sent_msat": "5004000msat",
+        }, "")
+        doc_ok = self.run_verb("pay-node", "--kind", "reset", "--impl", "cl", "--yes")
+        self.assertEqual((0, "reset", "confirmed", 50, 4),
+                         (doc_ok["exit_code"], doc_ok["kind"], doc_ok["state"],
+                          doc_ok["fee_limit_sats"], doc_ok["node_payment"]["fee_sats"]))
+        self.assertIsNone(mod.load_pending(self.deps)["reset"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
