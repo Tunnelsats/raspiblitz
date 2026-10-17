@@ -45,6 +45,8 @@ EXIT_USAGE = 2
 EXIT_NOT_CONFIGURED = 3
 EXIT_UNSAFE = 4
 EXIT_DEGRADED = 5
+EXIT_PAY_FAILED = 10
+EXIT_PENDING = 11
 EXIT_INVALID_API = 12
 EXIT_API_UNAVAILABLE = 13
 EXIT_REFUSED = 14
@@ -54,6 +56,7 @@ APPDATA = "/mnt/hdd/app-data"
 STATE_DIR = APPDATA + "/tunnelsats"
 CONF_FILE = STATE_DIR + "/tunnelsats.conf"
 STATE_FILE = STATE_DIR + "/state.json"
+PENDING_FILE = STATE_DIR + "/pending.json"
 LAST_RESTORE_FILE = STATE_DIR + "/last-restore.json"
 RB_CONF = APPDATA + "/raspiblitz.conf"
 CUSTOM_INSTALLS = APPDATA + "/custom-installs.sh"
@@ -62,9 +65,11 @@ RUN_DIR = "/run/tunnelsats"
 # lives next to it, in a root 0700 directory of its own
 LOCK_DIR = "/run/tunnelsats-rb"
 LOCK_FILE = LOCK_DIR + "/module.lock"
+SERVERS_CACHE_FILE = LOCK_DIR + "/servers-cache.json"
 STOPPED_UNITS = RUN_DIR + "/stopped-units"
 ITS = "/home/admin/config.scripts/internet.tunnelsats.sh"
 BLITZ_CONF = "/home/admin/config.scripts/blitz.conf.sh"
+BLITZ_DISPLAY = "/home/admin/config.scripts/blitz.display.sh"
 NOTIFY = "/home/admin/config.scripts/blitz.notify.sh"
 LND_ASSET = "/home/admin/assets/lnd.service"
 CL_INSTALL_SERVICE = "/home/admin/config.scripts/cl.install-service.sh"
@@ -74,11 +79,33 @@ LNCLI = ["sudo", "-u", "bitcoin", "/usr/local/bin/lncli", "-n=mainnet", "--rpcse
 UNIT_DIR = "/etc/systemd/system"
 LEGACY_CONF_RE = re.compile(r"/etc/wireguard/[A-Za-z0-9_.-]{1,64}\.conf")
 
-API_STATUS_URL = "https://tunnelsats.com/api/public/v1/subscription/status"
+API_BASE_URL = "https://tunnelsats.com/api/public/v1"
+API_SERVERS_URL = API_BASE_URL + "/servers"
+API_CREATE_URL = API_BASE_URL + "/subscription/create"
+API_RENEW_URL = API_BASE_URL + "/subscription/renew"
+API_CLAIM_URL = API_BASE_URL + "/subscription/claim"
+API_STATUS_URL = API_BASE_URL + "/subscription/status"
 API_CONNECT_TIMEOUT = 15
 API_READ_TIMEOUT = 30
 API_MAX_BYTES = 65536
 API_CACHE_SECONDS = 6 * 3600
+SERVERS_CACHE_SECONDS = 60
+PENDING_TTL_SECONDS = 24 * 3600
+INVOICE_DEFAULT_TTL_SECONDS = 3600
+MAX_RETAINED_ORDERS = 5
+MAX_RENEW_SATS = 200000
+DURATIONS = (1, 3, 6, 12)
+PAY_MODES = ("node", "qr", "copy", "none")
+
+OFFLINE_SERVERS = (
+    {"id": "eu-de", "country": "Germany", "city": "Frankfurt", "flag": "DE", "status": "active"},
+    {"id": "eu-nl", "country": "Netherlands", "city": "Amsterdam", "flag": "NL", "status": "active"},
+    {"id": "eu-ch", "country": "Switzerland", "city": "Zurich", "flag": "CH", "status": "active"},
+    {"id": "us-east", "country": "USA", "city": "Ashburn", "flag": "US", "status": "active"},
+    {"id": "us-west", "country": "USA", "city": "Los Angeles", "flag": "US", "status": "active"},
+    {"id": "ca-east", "country": "Canada", "city": "Montreal", "flag": "CA", "status": "active"},
+    {"id": "ap-sg", "country": "Singapore", "city": "Singapore", "flag": "SG", "status": "active"},
+)
 
 # Timeouts (s) for internet.tunnelsats.sh, each above the script's own worst case, so the script
 # ends by itself and cleans up; run_command stops the whole process group only as a last resort.
@@ -128,6 +155,12 @@ DROPIN_RE = re.compile(r"/etc/systemd/system/([A-Za-z0-9_.@-]+\.service)\.d/tunn
 # Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
 KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
 HOST_RE = re.compile(r"([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+tunnelsats\.com")
+SERVER_ID_RE = re.compile(r"[a-z0-9-]{2,32}")
+HEX64_RE = re.compile(r"[0-9a-f]{64}")
+ORDER_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+BOLT11_AMOUNT_RE = re.compile(r"lnbc(?:(\d+)([munp])?)?1[0-9a-z]{7,}", re.IGNORECASE)
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_CHARSET_MAP = {c: i for i, c in enumerate(_BECH32_CHARSET)}
 ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})")
 SECTION_RE = re.compile(r"\[([A-Za-z]+)\]")
 KV_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)")
@@ -194,19 +227,22 @@ def run_command(argv, timeout=60, interactive=False):
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-def http_post_json(url, payload):
-    """POST JSON over TLS (certificate verification on, no proxy). Returns (status, headers, body).
-    15 s to connect, 30 s per read, at most API_MAX_BYTES of body. Raises OSError on failure."""
+def http_post_json(url, payload=None):
+    """GET (payload is None) or POST JSON over TLS (certificate verification on, no proxy).
+    Returns (status, headers, body). 15 s to connect, 30 s per read, at most API_MAX_BYTES of body.
+    Raises OSError on failure."""
     parts = urllib.parse.urlsplit(url)
-    body = json.dumps(payload).encode()
+    method = "GET" if payload is None else "POST"
+    body = None if payload is None else json.dumps(payload).encode()
+    req_headers = {"Accept": "application/json", "User-Agent": "TunnelSats-RaspiBlitz/" + MODULE_VERSION}
+    if body is not None:
+        req_headers["Content-Type"] = "application/json"
     conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=API_CONNECT_TIMEOUT,
                                        context=ssl.create_default_context())
     try:
         conn.connect()
         conn.sock.settimeout(API_READ_TIMEOUT)
-        conn.request("POST", parts.path, body=body, headers={
-            "Content-Type": "application/json", "Accept": "application/json",
-            "User-Agent": "TunnelSats-RaspiBlitz/" + MODULE_VERSION})
+        conn.request(method, parts.path, body=body, headers=req_headers)
         resp = conn.getresponse()
         raw = resp.read(API_MAX_BYTES + 1)
         headers = {k.lower(): v for k, v in resp.getheaders()}
@@ -412,6 +448,147 @@ def public_key_of(private_b64):
     if len(raw) != 32:
         raise ModuleError("E_CONFIG_INVALID", "usage", "PrivateKey is not a 32-byte key", EXIT_USAGE)
     return base64.b64encode(x25519(raw, (9).to_bytes(32, "little"))).decode()
+
+
+def generate_wg_keypair():
+    """Generates an RFC 7748 X25519 WireGuard keypair in-process. Returns (private_b64, public_b64)."""
+    raw = bytearray(secrets.token_bytes(32))
+    raw[0] &= 248
+    raw[31] &= 127
+    raw[31] |= 64
+    private_b64 = base64.b64encode(bytes(raw)).decode()
+    return private_b64, public_key_of(private_b64)
+
+
+# ------------------------------------------------------------------------------------------
+# BOLT11 Bech32 decoder and amount/payment-hash verifier
+# ------------------------------------------------------------------------------------------
+
+def _bech32_polymod(values):
+    gen = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        b = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            if (b >> i) & 1:
+                chk ^= gen[i]
+    return chk
+
+
+def _bech32_hrp_expand(hrp):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def _bech32_verify_checksum(hrp, data):
+    return _bech32_polymod(_bech32_hrp_expand(hrp) + data) == 1
+
+
+def bolt11_amount_sats(invoice):
+    """Amount in whole satoshis from a mainnet BOLT11 HRP, or None when omitted, sub-satoshi, or invalid."""
+    if not isinstance(invoice, str):
+        return None
+    match = BOLT11_AMOUNT_RE.fullmatch(invoice.strip())
+    if not match or not match.group(1):
+        return None
+    value = int(match.group(1))
+    unit = (match.group(2) or "").lower()
+    msat_per_unit = {"": 100_000_000_000, "m": 100_000_000, "u": 100_000, "n": 100, "p": 0.1}.get(unit)
+    if msat_per_unit is None:
+        return None
+    msats = round(value * msat_per_unit)
+    if msats <= 0 or msats % 1000 != 0:
+        return None
+    return msats // 1000
+
+
+def decode_bolt11(bolt11):
+    """Decodes and validates a mainnet BOLT11 invoice in pure Python. Returns a dict with
+    amount_sats, payment_hash, timestamp, and expiry_seconds, or raises ModuleError(E_INVOICE_MISMATCH)."""
+    if not isinstance(bolt11, str) or not bolt11.strip() or len(bolt11.strip()) > 4000:
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response", "invoice is missing or invalid", EXIT_INVALID_API)
+    raw_s = bolt11.strip()
+    if raw_s != raw_s.lower() and raw_s != raw_s.upper():
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                          "invoice mixes upper and lower case", EXIT_INVALID_API)
+    inv = raw_s.lower()
+    amount_sats = bolt11_amount_sats(inv)
+    if amount_sats is None or amount_sats <= 0:
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                          "invoice does not carry a positive whole-satoshi amount", EXIT_INVALID_API)
+    sep = inv.rfind("1")
+    if sep < 4:
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response", "invoice has no Bech32 separator", EXIT_INVALID_API)
+    hrp = inv[:sep]
+    data_part = inv[sep + 1:]
+    if len(data_part) < 117:
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response", "invoice data section is too short", EXIT_INVALID_API)
+    try:
+        words = [_BECH32_CHARSET_MAP[c] for c in data_part]
+    except KeyError:
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                          "invoice contains invalid Bech32 characters", EXIT_INVALID_API) from None
+    if not _bech32_verify_checksum(hrp, words):
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                          "invoice Bech32 checksum failed", EXIT_INVALID_API)
+    timestamp = 0
+    for w in words[:7]:
+        timestamp = (timestamp << 5) | w
+    tagged = words[7:len(words) - 110]
+    idx = 0
+    embedded_hash = None
+    expiry_seconds = INVOICE_DEFAULT_TTL_SECONDS
+    seen_expiry = False
+    while idx + 3 <= len(tagged):
+        tag_type = tagged[idx]
+        data_len = (tagged[idx + 1] << 5) | tagged[idx + 2]
+        idx += 3
+        if idx + data_len > len(tagged):
+            raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                              "invoice has a truncated tagged field", EXIT_INVALID_API)
+        field_words = tagged[idx:idx + data_len]
+        idx += data_len
+        if tag_type == 1 and data_len == 52 and embedded_hash is None:
+            acc = 0
+            for w in field_words:
+                acc = (acc << 5) | w
+            embedded_hash = (acc >> 4).to_bytes(32, "big").hex()
+        elif tag_type == 6 and not seen_expiry and data_len > 0:
+            seen_expiry = True
+            exp_val = 0
+            for w in field_words:
+                exp_val = (exp_val << 5) | w
+            if exp_val > 0:
+                expiry_seconds = exp_val
+    if embedded_hash is None:
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                          "invoice has no payment hash ('p' tag)", EXIT_INVALID_API)
+    return {"amount_sats": amount_sats, "payment_hash": embedded_hash,
+            "timestamp": timestamp, "expiry_seconds": expiry_seconds}
+
+
+def verify_bolt11_invoice(bolt11, expected_payment_hash, expected_sats=None, max_sats=MAX_RENEW_SATS):
+    """Verifies a BOLT11 invoice against expected_payment_hash and either expected_sats (exact match)
+    or max_sats (ceiling when the API omits amountSats). Returns the decoded dict."""
+    if not isinstance(expected_payment_hash, str) or not HEX64_RE.fullmatch(expected_payment_hash.lower()):
+        raise ModuleError("E_API_INVALID", "invalid_response", "paymentHash is not 64 hex characters", EXIT_INVALID_API)
+    decoded = decode_bolt11(bolt11)
+    if decoded["payment_hash"] != expected_payment_hash.lower():
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                          "invoice payment hash does not match paymentHash", EXIT_INVALID_API)
+    if expected_sats is not None:
+        if isinstance(expected_sats, bool) or not isinstance(expected_sats, int) or expected_sats <= 0:
+            raise ModuleError("E_API_INVALID", "invalid_response", "amountSats is not a positive integer",
+                              EXIT_INVALID_API)
+        if decoded["amount_sats"] != expected_sats:
+            raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                              "invoice amount (%d sats) does not match amountSats (%d sats)"
+                              % (decoded["amount_sats"], expected_sats), EXIT_INVALID_API)
+    elif decoded["amount_sats"] > max_sats:
+        raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                          "invoice amount (%d sats) exceeds ceiling (%d sats)"
+                          % (decoded["amount_sats"], max_sats), EXIT_INVALID_API)
+    return decoded
 
 
 # ------------------------------------------------------------------------------------------
@@ -700,6 +877,116 @@ def load_stored_config(deps):
         return None
 
 
+def empty_pending():
+    return {"schema": "raspiblitz.tunnelsats.pending/1", "order": None, "renewal": None, "reset": None,
+            "retained_orders": [], "recovered_configs": []}
+
+
+def load_pending(deps):
+    try:
+        with open(deps.path(PENDING_FILE), encoding="utf-8") as handle:
+            doc = json.load(handle)
+        if not isinstance(doc, dict) or doc.get("schema") != "raspiblitz.tunnelsats.pending/1":
+            return empty_pending()
+        base = empty_pending()
+        for key in ("order", "renewal", "reset"):
+            if isinstance(doc.get(key), dict):
+                base[key] = doc[key]
+        if isinstance(doc.get("retained_orders"), list):
+            base["retained_orders"] = [x for x in doc["retained_orders"] if isinstance(x, dict)]
+        if isinstance(doc.get("recovered_configs"), list):
+            base["recovered_configs"] = [x for x in doc["recovered_configs"] if isinstance(x, dict)]
+        return base
+    except (OSError, ValueError):
+        return empty_pending()
+
+
+def save_pending(deps, doc, shred_first=False):
+    ensure_dir(deps.path(STATE_DIR), 0o700)
+    if shred_first:
+        shred(deps.path(PENDING_FILE))
+    write_private(deps.path(PENDING_FILE), (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode())
+
+
+def _item_protected_from_prune(item):
+    """True if item is paid, claiming, needs_support, or has an in-flight/uncertain node payment."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("state") in ("paid", "claiming", "needs_support"):
+        return True
+    np_state = (item.get("node_payment") or {}).get("state") if isinstance(item.get("node_payment"), dict) else None
+    return np_state in ("paying", "uncertain", "succeeded")
+
+
+def prune_pending(deps, doc=None, now=None, persist=True):
+    """Refreshes expired awaiting_payment items to expired_unpaid and prunes unpaid items past
+    retained_until. Never prunes paid, claiming, needs_support, or uncertain node payments.
+    Shreds pending.json before rewriting when an order private key is dropped."""
+    now = now or deps.clock()
+    doc = load_pending(deps) if doc is None else doc
+    changed = False
+    dropped_key = False
+
+    def refresh_and_keep(item):
+        nonlocal changed, dropped_key
+        if not isinstance(item, dict):
+            return None
+        exp = parse_iso(item.get("invoice_expires_at"))
+        if item.get("state") == "awaiting_payment" and not _item_protected_from_prune(item) and exp and now >= exp:
+            item["state"] = "expired_unpaid"
+            changed = True
+        ret = parse_iso(item.get("retained_until"))
+        if not _item_protected_from_prune(item) and item.get("state") in ("awaiting_payment", "expired_unpaid") \
+                and ret and now >= ret:
+            if item.get("private_key"):
+                dropped_key = True
+            changed = True
+            return None
+        return item
+
+    for key in ("order", "renewal", "reset"):
+        if doc.get(key) is not None:
+            doc[key] = refresh_and_keep(doc[key])
+    kept_retained = []
+    for item in doc.get("retained_orders") or []:
+        updated = refresh_and_keep(item)
+        if updated is not None:
+            kept_retained.append(updated)
+    if len(kept_retained) > MAX_RETAINED_ORDERS:
+        # Keep protected orders first, then newest by created_at
+        protected = [x for x in kept_retained if _item_protected_from_prune(x)]
+        unprotected = [x for x in kept_retained if not _item_protected_from_prune(x)]
+        keep_count = max(0, MAX_RETAINED_ORDERS - len(protected))
+        dropped = unprotected[:max(0, len(unprotected) - keep_count)]
+        if any(x.get("private_key") for x in dropped):
+            dropped_key = True
+        kept_retained = protected + (unprotected[-keep_count:] if keep_count else [])
+        changed = True
+    doc["retained_orders"] = kept_retained
+    if changed and persist and os.path.exists(deps.path(PENDING_FILE)):
+        save_pending(deps, doc, shred_first=dropped_key)
+    return doc
+
+
+def redact_pending_item(item):
+    """Returns a copy of a pending item without private_key or full invoice."""
+    if not isinstance(item, dict):
+        return None
+    out = {k: v for k, v in item.items() if k not in ("private_key", "invoice")}
+    if "private_key" in item:
+        out["has_private_key"] = bool(item.get("private_key"))
+    return out
+
+
+def tick_timer_needed(deps):
+    """True when tunnelsats is on, a subscription is stored, or pending.json holds an active item."""
+    if read_rb_conf(deps).get("tunnelsats") == "on" or load_state(deps) is not None:
+        return True
+    pending = load_pending(deps)
+    return bool(pending.get("order") or pending.get("renewal") or pending.get("reset")
+                or pending.get("retained_orders"))
+
+
 class Lock:
     """flock on /run/tunnelsats-rb/module.lock: state-changing verbs run one at a time. Not below
     /run/tunnelsats: uninstall --managed removes that directory while REMOVE or REPAIR holds the lock,
@@ -799,6 +1086,7 @@ class Result:
 
     def error(self, code, cls, message, exit_code=None):
         self.errors.append({"code": code, "class": cls, "message": message})
+        self.fields.setdefault("error", code)
         if exit_code is not None:
             self.exit_code = exit_code
 
@@ -883,6 +1171,83 @@ def cmd_detect(deps, args, result):
     result.fields.update(detect(deps))
     if not result.fields["eligible"] and not result.fields["configured"]:
         result.exit_code = EXIT_NOT_CONFIGURED
+
+
+# ------------------------------------------------------------------------------------------
+# servers
+# ------------------------------------------------------------------------------------------
+
+def _validate_servers_payload(raw):
+    if not raw or len(raw) > API_MAX_BYTES:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    items = parsed.get("servers") if isinstance(parsed, dict) else parsed
+    if not isinstance(items, list) or not items:
+        return None
+    servers = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            return None
+        sid = entry.get("id")
+        country = entry.get("country")
+        city = entry.get("city")
+        flag = entry.get("flag") or ""
+        status = entry.get("status") or "active"
+        if not isinstance(sid, str) or not SERVER_ID_RE.fullmatch(sid):
+            return None
+        if not isinstance(country, str) or not country.strip() or len(country) > 64:
+            return None
+        if not isinstance(city, str) or not city.strip() or len(city) > 64:
+            return None
+        if not isinstance(flag, str) or len(flag) > 16:
+            return None
+        if status not in ("active", "full", "maintenance", "disabled"):
+            return None
+        servers.append({"id": sid, "country": country.strip(), "city": city.strip(),
+                        "flag": flag.strip(), "status": status})
+    return servers
+
+
+def _load_servers_cache(deps):
+    try:
+        with open(deps.path(SERVERS_CACHE_FILE), encoding="utf-8") as handle:
+            doc = json.load(handle)
+        if not isinstance(doc, dict) or not isinstance(doc.get("servers"), list) or not doc["servers"]:
+            return None, None
+        return doc["servers"], parse_iso(doc.get("fetched_at"))
+    except (OSError, ValueError):
+        return None, None
+
+
+def fetch_servers(deps):
+    """Returns (servers, stale, offline_list) with a 60 s cache in /run/tunnelsats-rb/servers-cache.json."""
+    cached, fetched_at = _load_servers_cache(deps)
+    if cached and fetched_at and 0 <= (deps.clock() - fetched_at).total_seconds() <= SERVERS_CACHE_SECONDS:
+        return cached, False, False
+    try:
+        status, _headers, raw = deps.http(API_SERVERS_URL, None)
+    except Exception:
+        status, raw = 0, b""
+    servers = _validate_servers_payload(raw) if status == 200 else None
+    if servers:
+        try:
+            ensure_dir(deps.path(LOCK_DIR), 0o700)
+            write_private(deps.path(SERVERS_CACHE_FILE),
+                          (json.dumps({"fetched_at": now_iso(deps), "servers": servers}, sort_keys=True) + "\n").encode())
+        except ModuleError:
+            pass
+        return servers, False, False
+    if cached:
+        return cached, True, False
+    return [dict(s) for s in OFFLINE_SERVERS], True, True
+
+
+def cmd_servers(deps, args, result):
+    servers, stale, offline_list = fetch_servers(deps)
+    result.fields.update({"servers": servers, "stale": stale, "offline_list": offline_list})
 
 
 # ------------------------------------------------------------------------------------------
@@ -1769,7 +2134,7 @@ def announce_cleanup(deps, unit, state, record, wait=120, step=5, candidates=Non
     return "removed", []
 
 
-def zero_artifacts(deps, impl, conf_flag_off_expected=True):
+def zero_artifacts(deps, impl, conf_flag_off_expected=True, keep_tick_timer=False):
     """What is left after REMOVE (design 6.6 step 10)."""
     leftovers = []
     warnings = []
@@ -1789,7 +2154,7 @@ def zero_artifacts(deps, impl, conf_flag_off_expected=True):
     if read_rb_conf(deps).get("tunnelsats") == "on":
         leftovers.append("tunnelsats=on in raspiblitz.conf")
     rc, out, _err = deps.run([ITS, "tick-timer", "status"], timeout=30)
-    if out.strip() != "absent":
+    if not keep_tick_timer and out.strip() != "absent":
         leftovers.append("tunnelsats-tick.timer")
     if impl:
         args, props = daemon_cmdline(deps, UNITS[impl])
@@ -1802,6 +2167,12 @@ def zero_artifacts(deps, impl, conf_flag_off_expected=True):
 
 def purge(deps):
     shred(deps.path(CONF_FILE))
+    shred(deps.path(PENDING_FILE))
+    state_dir = deps.path(STATE_DIR)
+    if os.path.isdir(state_dir):
+        for entry in os.listdir(state_dir):
+            if entry.startswith("recovered-") and entry.endswith(".conf"):
+                shred(os.path.join(state_dir, entry))
     for name in (STATE_FILE, LAST_RESTORE_FILE):
         try:
             os.unlink(deps.path(name))
@@ -2034,7 +2405,13 @@ def cmd_uninstall(deps, args, result):
             pass
         rc, block = its(deps, ["block-remove", "--json"], timeout=30)
         result.fields["block"] = (block or {}).get("state") if rc == 0 else "error:%s" % tool_error(block, "E_BLOCK")
-        deps.run([ITS, "tick-timer", "off"], timeout=60)
+        pending_doc = load_pending(deps)
+        keep_tick = not args.purge and bool(
+            pending_doc.get("order") or pending_doc.get("renewal") or pending_doc.get("reset")
+            or pending_doc.get("retained_orders")
+        )
+        if not keep_tick:
+            deps.run([ITS, "tick-timer", "off"], timeout=60)
         unit = UNITS.get(impl)
         doc = {}
         notes = []
@@ -2186,7 +2563,7 @@ def cmd_uninstall(deps, args, result):
         candidates = announce_candidates(deps, state, record) if unit == UNITS["lnd"] else []
         cleanup, cleanup_notes = announce_cleanup(deps, unit, state, record, candidates=candidates)
         result.fields["announce_cleanup"] = cleanup
-        leftovers, warnings = zero_artifacts(deps, impl)
+        leftovers, warnings = zero_artifacts(deps, impl, keep_tick_timer=keep_tick)
         if other_action:
             result.fields["other_impl_lines"] = other_action["lines"]
             warnings.insert(0, "%s was left as it is: its config is not Tor-only at rest (%s). TunnelSats never "
@@ -2670,9 +3047,9 @@ def status_text(doc):
 # CLI
 # ------------------------------------------------------------------------------------------
 
-HANDLERS = {"menu": cmd_menu, "import": cmd_import, "adopt": cmd_adopt, "status": cmd_status, "check": cmd_check,
-            "detect": cmd_detect, "repair": cmd_repair, "uninstall": cmd_uninstall,
-            "subscriptions-list": cmd_subscriptions_list, "tick": cmd_tick}
+HANDLERS = {"menu": cmd_menu, "servers": cmd_servers, "import": cmd_import, "adopt": cmd_adopt,
+            "status": cmd_status, "check": cmd_check, "detect": cmd_detect, "repair": cmd_repair,
+            "uninstall": cmd_uninstall, "subscriptions-list": cmd_subscriptions_list, "tick": cmd_tick}
 
 
 class _UsageError(Exception):
@@ -2696,6 +3073,7 @@ def build_parser():
         return p
 
     verb("menu")
+    verb("servers")
     p = verb("import")
     p.add_argument("--file", required=True)
     p.add_argument("--impl", choices=IMPLS)

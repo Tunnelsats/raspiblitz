@@ -7,6 +7,7 @@ answers with real documents from fixtures/; one test routes the guard to the rea
 Run: python3 -m unittest discover -s test/tunnelsats
 """
 
+import base64
 import binascii
 import datetime
 import hashlib
@@ -54,6 +55,22 @@ def fixture_json(*parts):
     return json.loads(fixture(*parts))
 
 
+def make_bolt11(hrp="lnbc2500u", payment_hash="a" * 64, timestamp=None, expiry=None):
+    ts = int(NOW.timestamp()) if timestamp is None else int(timestamp)
+    data = [(ts >> (5 * (6 - i))) & 31 for i in range(7)]
+    if payment_hash is not None:
+        h_int = int(payment_hash, 16) << 4
+        p_words = [(h_int >> (5 * (51 - i))) & 31 for i in range(52)]
+        data += [1, (52 >> 5) & 31, 52 & 31] + p_words
+    if expiry is not None:
+        data += [6, 0, 3, (expiry >> 10) & 31, (expiry >> 5) & 31, expiry & 31]
+    data += [(i * 7 + 3) & 31 for i in range(104)]
+    values = mod._bech32_hrp_expand(hrp.lower()) + data + [0, 0, 0, 0, 0, 0]
+    polymod = mod._bech32_polymod(values) ^ 1
+    checksum = [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(mod._BECH32_CHARSET[d] for d in data + checksum)
+
+
 class FakeSystem:
     """Records every command and answers with scripted results; HTTP likewise."""
 
@@ -65,6 +82,9 @@ class FakeSystem:
         self.http_responses = []
         self.sleeps = []
         self.notify_rc = 0
+        self.qrencode_rc = 0
+        self.wg_genkey = ALICE_PRIV
+        self.wg_genkey_rc = 0
         self.real_guard = False
         # systemctl start, stop, enable and disable change the unit state below, as on a node
         self.stateful = True
@@ -177,7 +197,23 @@ class FakeSystem:
                         os.path.join(self.root, argv[-1].lstrip("/")))
             return 0, "", ""
         if prog == "wg":
+            if len(argv) >= 2 and argv[1] == "genkey":
+                return self.wg_genkey_rc, (self.wg_genkey + "\n" if self.wg_genkey_rc == 0 else ""), ""
             return 0, self.wg.get(argv[3], ""), ""
+        if prog == "qrencode":
+            if self.qrencode_rc != 0:
+                return self.qrencode_rc, "", "qrencode failed"
+            if "-o" in argv:
+                out_path = argv[argv.index("-o") + 1]
+                if not out_path.startswith(self.root):
+                    out_path = os.path.join(self.root, out_path.lstrip("/"))
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "wb") as handle:
+                    handle.write(b"\x89PNG\r\n\x1a\nFAKEQR")
+                return 0, "", ""
+            return 0, "FAKE_ANSI_QR\n", ""
+        if prog == mod.BLITZ_DISPLAY:
+            return 0, "", ""
         if prog == "sudo":
             if "updatenodeannouncement" in argv:
                 if self.announce_rc == 0 and self.getinfo is not None:
@@ -226,7 +262,7 @@ class FakeSystem:
         return -1
 
     # -- http -------------------------------------------------------------------------------
-    def http(self, url, payload):
+    def http(self, url, payload=None):
         self.http_calls.append((url, payload))
         answer = self.http_responses.pop(0) if self.http_responses else (200, {}, fixture("api", "status_enabled.json").encode())
         if isinstance(answer, Exception):
@@ -2375,6 +2411,161 @@ class TestCustody(ModuleTestCase):
                 with open(path, "rb") as handle:
                     self.assertNotIn(ALICE_PRIV.encode(), handle.read(), path)
         self.assertTrue(all(ALICE_PRIV not in json.dumps(d) for d in self.docs))
+
+
+# ------------------------------------------------------------------------------------------
+# BOLT11, WireGuard keygen, pending store, and servers (P3 Commit 1)
+# ------------------------------------------------------------------------------------------
+
+class TestBolt11AndKeygen(ModuleTestCase):
+    def test_decode_bolt11_and_verify_invoice(self):
+        ph = "a" * 64
+        inv_25k = make_bolt11("lnbc250u", payment_hash=ph, expiry=900)
+        self.assertEqual(25000, mod.bolt11_amount_sats(inv_25k))
+        decoded = mod.verify_bolt11_invoice(inv_25k, ph, expected_sats=25000)
+        self.assertEqual((25000, ph, 900), (decoded["amount_sats"], decoded["payment_hash"], decoded["expiry_seconds"]))
+        self.assertEqual(25000, mod.verify_bolt11_invoice(inv_25k, ph, expected_sats=None)["amount_sats"])
+        # m = milli-BTC (0.001 BTC = 100,000 sats), n = nano-BTC (0.1 sat), p = pico-BTC (0.0001 sat)
+        self.assertEqual(100000, mod.bolt11_amount_sats(make_bolt11("lnbc1m")))
+        self.assertEqual(500, mod.bolt11_amount_sats(make_bolt11("lnbc5000n")))
+        self.assertEqual(2, mod.bolt11_amount_sats(make_bolt11("lnbc20000p")))
+        self.assertEqual(100000000, mod.bolt11_amount_sats(make_bolt11("lnbc1")))
+
+    def test_verify_bolt11_rejects_bad_invoices(self):
+        ph = "a" * 64
+        inv_25k = make_bolt11("lnbc250u", payment_hash=ph)
+        # Tampered checksum
+        bad_csum = inv_25k[:-1] + ("q" if inv_25k[-1] != "q" else "p")
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(bad_csum, ph, expected_sats=25000)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Mixed case rejected by Bech32
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice("LNBC" + inv_25k[4:], ph, expected_sats=25000)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Non-mainnet prefix rejected
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(make_bolt11("lntb250u", payment_hash=ph), ph, expected_sats=25000)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Zero-amount invoice rejected
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(make_bolt11("lnbc", payment_hash=ph), ph, expected_sats=25000)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Fractional satoshis rejected
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(make_bolt11("lnbc15n", payment_hash=ph), ph, expected_sats=1)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Missing p tag rejected
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(make_bolt11("lnbc250u", payment_hash=None), ph, expected_sats=25000)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Mismatch between BOLT11 p tag and expected_payment_hash
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(inv_25k, "b" * 64, expected_sats=25000)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Mismatch between BOLT11 amount and expected_sats
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(inv_25k, ph, expected_sats=30000)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+        # Exceeds MAX_RENEW_SATS ceiling when expected_sats is omitted
+        with self.assertRaises(mod.ModuleError) as ctx:
+            mod.verify_bolt11_invoice(make_bolt11("lnbc3m", payment_hash=ph), ph, expected_sats=None)
+        self.assertEqual("E_INVOICE_MISMATCH", ctx.exception.code)
+
+    def test_generate_wg_keypair(self):
+        priv, pub = mod.generate_wg_keypair()
+        self.assertTrue(mod.KEY_RE.fullmatch(priv) and mod.KEY_RE.fullmatch(pub))
+        self.assertEqual(pub, mod.public_key_of(priv))
+        raw = base64.b64decode(priv)
+        self.assertEqual(0, raw[0] & 7)
+        self.assertEqual(64, raw[31] & 192)
+
+
+class TestPendingStore(ModuleTestCase):
+    def test_save_load_redact_and_prune_pending(self):
+        pending = mod.load_pending(self.deps)
+        self.assertEqual(mod.empty_pending(), pending)
+        pending["order"] = {
+            "order_id": "ord-1",
+            "payment_hash": "a" * 64,
+            "invoice": make_bolt11("lnbc250u"),
+            "amount_sats": 25000,
+            "server_id": "de2",
+            "months": 3,
+            "private_key": ALICE_PRIV,
+            "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T10:00:00Z",
+            "invoice_expires_at": "2026-10-14T10:15:00Z",
+            "retained_until": "2026-10-15T10:00:00Z",
+            "state": "awaiting_payment",
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+        st = os.stat(self.path(mod.PENDING_FILE))
+        self.assertEqual(0o600, st.st_mode & 0o777)
+
+        # At NOW (12:00Z), invoice_expires_at (10:15Z) has passed, so state transitions to expired_unpaid
+        mod.prune_pending(self.deps, pending, now=NOW)
+        self.assertEqual("expired_unpaid", pending["order"]["state"])
+        redacted = mod.redact_pending_item(pending["order"])
+        self.assertNotIn("private_key", redacted)
+        self.assertNotIn("invoice", redacted)
+        self.assertTrue(redacted["has_private_key"])
+        self.assertEqual(ALICE_PUB, redacted["public_key"])
+
+        # Past retained_until (2026-10-16), unpaid expired order is pruned and drops private key
+        later = datetime.datetime(2026, 10, 16, 0, 0, 0, tzinfo=datetime.timezone.utc)
+        mod.prune_pending(self.deps, pending, now=later)
+        self.assertIsNone(pending["order"])
+        with open(self.path(mod.PENDING_FILE), "rb") as handle:
+            self.assertNotIn(ALICE_PRIV.encode(), handle.read())
+
+    def test_protected_orders_are_never_pruned(self):
+        for state, np_state in (("paid", "none"), ("claiming", "none"), ("needs_support", "none"),
+                                ("awaiting_payment", "paying"), ("awaiting_payment", "uncertain"),
+                                ("awaiting_payment", "succeeded")):
+            pending = mod.empty_pending()
+            pending["order"] = {
+                "order_id": "ord-prot",
+                "payment_hash": "b" * 64,
+                "private_key": ALICE_PRIV,
+                "public_key": ALICE_PUB,
+                "invoice_expires_at": "2026-10-14T10:15:00Z",
+                "retained_until": "2026-10-14T11:00:00Z",
+                "state": state,
+                "node_payment": {"state": np_state, "result": None},
+            }
+            later = datetime.datetime(2026, 10, 20, 0, 0, 0, tzinfo=datetime.timezone.utc)
+            mod.prune_pending(self.deps, pending, now=later, persist=False)
+            self.assertIsNotNone(pending["order"], (state, np_state))
+
+
+class TestServers(ModuleTestCase):
+    def test_live_servers_cache_and_offline_fallback(self):
+        live = [{"id": "de2", "country": "Germany", "city": "Frankfurt", "flag": "DE", "status": "active"},
+                {"id": "us-east1", "country": "United States", "city": "Ashburn", "flag": "US", "status": "active"}]
+        self.fake.http_responses = [(200, {}, json.dumps({"servers": live}).encode())]
+        doc = self.run_verb("servers")
+        self.assertEqual((0, False, False, 2), (doc["exit_code"], doc["stale"], doc["offline_list"], len(doc["servers"])))
+        self.assertEqual([(mod.API_SERVERS_URL, None)], self.fake.http_calls)
+
+        # Within 60s cache window: returns fresh cache without HTTP call
+        self.fake.http_calls.clear()
+        doc2 = self.run_verb("servers")
+        self.assertEqual(([], False, False, 2), (self.fake.http_calls, doc2["stale"], doc2["offline_list"], len(doc2["servers"])))
+
+        # Advance clock past 60s and make API fail: falls back to stale cache (offline_list=False)
+        self.deps.clock = lambda: NOW + datetime.timedelta(seconds=120)
+        self.fake.http_responses = [OSError("network down")]
+        doc3 = self.run_verb("servers")
+        self.assertEqual((True, False, 2), (doc3["stale"], doc3["offline_list"], len(doc3["servers"])))
+
+        # Remove cache file and make API return invalid server ID: falls back to static offline list
+        os.unlink(self.path(mod.SERVERS_CACHE_FILE))
+        self.fake.http_responses = [(200, {}, json.dumps([{"id": "BAD_ID!", "status": "active"}]).encode())]
+        doc4 = self.run_verb("servers")
+        self.assertEqual((True, True, len(mod.OFFLINE_SERVERS)),
+                         (doc4["stale"], doc4["offline_list"], len(doc4["servers"])))
 
 
 if __name__ == "__main__":

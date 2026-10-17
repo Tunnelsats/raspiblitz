@@ -8,7 +8,7 @@
     "command": {"type": "string", "pattern": "^[a-z-]+$"},
     "module_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
     "ok": {"type": "boolean"},
-    "exit_code": {"enum": [0, 1, 2, 3, 4, 5, 12, 13, 14]},
+    "exit_code": {"enum": [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14]},
     "errors": {
       "type": "array",
       "items": {
