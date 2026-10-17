@@ -1809,14 +1809,14 @@ class TestMenu(ModuleTestCase):
 
     def test_start_and_restart_only_while_tunnelsats_is_on(self):
         self.fake.units["lnd.service"]["ActiveState"] = "inactive"
-        self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE", "START"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE", "START"], self.tags())
         self.fake.units["lnd.service"]["ActiveState"] = "active"
         self.record(decision="tor-only", reason="emergency_block")
-        self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE", "RESTART"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE", "RESTART"], self.tags())
         self.fake.conf_set("tunnelsats", "off")
         for active in ("inactive", "failed", "active"):
             self.fake.units["lnd.service"]["ActiveState"] = active
-            self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE"], self.tags())
+            self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE"], self.tags())
 
     def test_menu_start_only_while_tunnelsats_is_on(self):
         self.fake.conf_set("tunnelsats", "off")
@@ -1831,12 +1831,25 @@ class TestMenu(ModuleTestCase):
     def test_without_a_subscription(self):
         shutil.rmtree(self.path(mod.STATE_DIR))
         choices, notice = mod.menu_choices(self.deps, None, mod.read_rb_conf(self.deps), {"adopt_available": True})
-        self.assertEqual((["IMPORT", "ADOPT", "ABOUT"], None), ([tag for tag, _text in choices], notice))
+        self.assertEqual((["BUY", "IMPORT", "ADOPT", "ABOUT"], None), ([tag for tag, _text in choices], notice))
+        pending = mod.empty_pending()
+        pending["order"] = {"order_id": "ord-1", "payment_hash": "a" * 64, "state": "awaiting_payment"}
+        mod.save_pending(self.deps, pending)
+        choices_resume, _ = mod.menu_choices(self.deps, None, mod.read_rb_conf(self.deps), {"adopt_available": False})
+        self.assertEqual(["BUY", "RESUME", "IMPORT", "ABOUT"], [tag for tag, _text in choices_resume])
 
     def test_adopted_legacy_offers_upgrade(self):
         shutil.rmtree(self.path(mod.STATE_DIR))
         self.store(mode="adopted_legacy")
-        self.assertEqual(["STATUS", "CHECK", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
+        state = mod.load_state(self.deps)
+        state["activation_pending"] = True
+        mod.save_state(self.deps, state)
+        pending = mod.empty_pending()
+        pending["renewal"] = {"renewal_id": "ren-1", "payment_hash": "b" * 64, "state": "awaiting_payment"}
+        mod.save_pending(self.deps, pending)
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "RESUME", "ACTIVATE", "UPGRADE", "REPAIR", "REMOVE"],
+                         self.tags())
 
 
 class TestAdopt(ModuleTestCase):
@@ -2823,6 +2836,147 @@ class TestClaimAndSettle(ModuleTestCase):
         ]
         doc = self.run_verb("settle", "--wait", "3")
         self.assertEqual((11, "awaiting_payment", [3]), (doc["exit_code"], doc["state"], self.fake.sleeps))
+
+
+class TestNotificationsAndTickHooks(ModuleTestCase):
+    def setUp(self):
+        super().setUp()
+        self.store()
+        self.activate_conf()
+        self.record(decision="hybrid", reason="ok")
+        self.fake.conf_set("notify", "on")
+
+    def notifies(self):
+        return self.fake.calls_of(mod.NOTIFY, "send")
+
+    def test_tick_test_hooks_tc38_and_raw_api(self):
+        # --now or --status-file without --no-persist is refused with E_USAGE
+        self.assertEqual((2, "E_USAGE"), (self.run_verb("tick", "--now", "2026-11-29T00:00:00Z")["exit_code"],
+                                          self.run_verb("tick", "--now", "2026-11-29T00:00:00Z")["error"]))
+        self.assertEqual((2, "E_USAGE"), (self.run_verb("tick", "--status-file", "/tmp/x")["exit_code"],
+                                          self.run_verb("tick", "--status-file", "/tmp/x")["error"]))
+
+        # status --raw-api returns validated API fields and no key material
+        raw_doc = self.run_verb("status", "--cached", "--raw-api")
+        self.assertIn("raw_api", raw_doc)
+        self.assertEqual("enabled", raw_doc["status"])
+        self.assertEqual("enabled", raw_doc["raw_api"]["status"])
+        self.assertEqual(0, raw_doc["bandwidth_resets_this_month"])
+        for forbidden in ("private_key", "PrivateKey", "presharedKey", "preshared_key", "fullConfig", "config"):
+            self.assertNotIn(forbidden, raw_doc["raw_api"])
+
+        # TC-38: 48h before expiry -> expiry_soon; 1h after expiry -> expired; notify_state on disk unchanged
+        doc_soon = self.run_verb("tick", "--now", "2026-11-29T00:00:00Z", "--no-persist")
+        self.assertTrue(doc_soon["test_hook"])
+        self.assertEqual([{"event": "expiry_soon", "outcome": "handed_off", "attempt": 1}], doc_soon["notifications"])
+        doc_exp = self.run_verb("tick", "--now", "2026-12-01T01:00:00Z", "--no-persist")
+        self.assertTrue(doc_exp["test_hook"])
+        self.assertEqual([{"event": "expired", "outcome": "handed_off", "attempt": 1}], doc_exp["notifications"])
+        self.assertIsNone(mod.load_state(self.deps).get("notify_state"))
+
+        # TC-38: --status-file bandwidth_high (85/100) and bandwidth_exhausted (100/100 disabled)
+        st85 = dict(raw_doc, bandwidth_used_gb=85, bandwidth_limit_gb=100)
+        st100 = dict(raw_doc, bandwidth_used_gb=100, bandwidth_limit_gb=100, status="disabled")
+        self.write("tmp/st85.json", json.dumps(st85))
+        self.write("tmp/st100.json", json.dumps(st100))
+        doc_bw85 = self.run_verb("tick", "--status-file", "/tmp/st85.json", "--no-persist")
+        self.assertEqual([{"event": "bandwidth_high", "outcome": "handed_off", "attempt": 1}],
+                         doc_bw85["notifications"])
+        doc_bw100 = self.run_verb("tick", "--status-file", "/tmp/st100.json", "--no-persist")
+        self.assertEqual([{"event": "bandwidth_exhausted", "outcome": "handed_off", "attempt": 1}],
+                         doc_bw100["notifications"])
+        self.assertIsNone(mod.load_state(self.deps).get("notify_state"))
+
+    def test_verdict_transitions_tc18_and_tc39(self):
+        # TC-18: degraded once, deduplicated on second tick, all_clear on recovery
+        degraded_doc = fixture_json("verify", "activating_tunnel_up.json")
+        for c in degraded_doc["checks"]:
+            if c["id"] == "wg_handshake":
+                c["result"] = "fail"
+                c["detail"] = "no handshake"
+        self.fake.its["verify --no-probe"] = (5, degraded_doc)
+        d1 = self.run_verb("tick")
+        self.assertEqual([{"event": "verdict_degraded", "outcome": "handed_off", "attempt": 1}], d1["notifications"])
+        d2 = self.run_verb("tick")
+        self.assertEqual([], d2["notifications"])
+        self.fake.its["verify --no-probe"] = (0, fixture_json("verify", "protected.json"))
+        d3 = self.run_verb("tick")
+        self.assertEqual([{"event": "all_clear", "outcome": "handed_off", "attempt": 1}], d3["notifications"])
+        d4 = self.run_verb("tick")
+        self.assertEqual([], d4["notifications"])
+
+        # TC-39a: unsafe once, then all_clear on recovery
+        unsafe_doc = dict(fixture_json("verify", "protected.json"), verdict="unsafe", exit_code=4, ok=False)
+        self.fake.its["verify --no-probe"] = (4, unsafe_doc)
+        u1 = self.run_verb("tick")
+        self.assertEqual([{"event": "verdict_unsafe", "outcome": "handed_off", "attempt": 1}], u1["notifications"])
+        self.fake.its["verify --no-probe"] = (0, fixture_json("verify", "protected.json"))
+        u2 = self.run_verb("tick")
+        self.assertEqual([{"event": "all_clear", "outcome": "handed_off", "attempt": 1}], u2["notifications"])
+
+        # TC-39b: notify=off -> skipped_disabled; re-enabling notify=on does not retroactively send or emit all_clear
+        self.fake.conf_set("notify", "off")
+        self.fake.its["verify --no-probe"] = (5, degraded_doc)
+        s1 = self.run_verb("tick")
+        self.assertEqual([{"event": "verdict_degraded", "outcome": "skipped_disabled", "attempt": 0}],
+                         s1["notifications"])
+        self.fake.conf_set("notify", "on")
+        self.assertEqual([], self.run_verb("tick")["notifications"])
+        self.fake.its["verify --no-probe"] = (0, fixture_json("verify", "protected.json"))
+        self.assertEqual([], self.run_verb("tick")["notifications"])
+
+        # TC-39c: notify delivery failure -> failed on attempt 1, succeeds on attempt 2, then all_clear
+        self.fake.notify_rc = 1
+        self.fake.its["verify --no-probe"] = (5, degraded_doc)
+        f1 = self.run_verb("tick")
+        self.assertEqual([{"event": "verdict_degraded", "outcome": "failed", "attempt": 1}], f1["notifications"])
+        self.fake.notify_rc = 0
+        f2 = self.run_verb("tick")
+        self.assertEqual([{"event": "verdict_degraded", "outcome": "handed_off", "attempt": 2}], f2["notifications"])
+        self.fake.its["verify --no-probe"] = (0, fixture_json("verify", "protected.json"))
+        f3 = self.run_verb("tick")
+        self.assertEqual([{"event": "all_clear", "outcome": "handed_off", "attempt": 1}], f3["notifications"])
+
+    def test_tick_background_settlement_tc37_and_6h_sync(self):
+        # TC-37: background order settlement in tick emits payment_received and activation_done
+        shutil.rmtree(self.path(mod.STATE_DIR))
+        self.fake.conf_set("tunnelsats", "off")
+        self.fake.conf_set("autoUnlock", "on")
+        self.fake.conf_set("notify", "on")
+        self.fake.its["verify"] = (0, fixture_json("verify", "protected.json"))
+        ph = "a" * 64
+        pending = mod.empty_pending()
+        pending["order"] = {
+            "order_id": "ord-bg", "payment_hash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph),
+            "amount_sats": 25000, "server_id": "de2", "months": 1, "impl": "lnd",
+            "private_key": ALICE_PRIV, "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T13:00:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": "awaiting_payment",
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+        claim_doc = {
+            "peer": {"publicKey": ALICE_PUB, "ip": "10.9.0.42/32", "presharedKey": BOB_PUB, "vpnPort": 24556},
+            "server": {"publicKey": BOB_PUB, "endpoint": "de2.tunnelsats.com:51820", "allowedIPs": "0.0.0.0/0", "persistentKeepalive": 25},
+            "subscriptionEnd": "2026-12-01T00:00:00Z",
+        }
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "paid"}).encode()),
+            (200, {}, json.dumps(claim_doc).encode()),
+            (200, {}, fixture("api", "status_enabled.json").encode()),
+        ]
+        doc = self.run_verb("tick")
+        self.assertEqual(["payment_received", "activation_done"], [n["event"] for n in doc["notifications"]])
+        self.assertEqual("active", doc["settle"]["state"])
+
+        # 6-hour status sync in tick when checked_at is older than 6h
+        state = mod.load_state(self.deps)
+        state["api"]["checked_at"] = "2026-10-14T01:00:00Z"
+        mod.save_state(self.deps, state)
+        updated_status = dict(fixture_json("api", "status_enabled.json"), bandwidth_used_gb=9.5)
+        self.fake.http_responses = [(200, {}, json.dumps(updated_status).encode())]
+        self.run_verb("tick")
+        self.assertEqual(9.5, mod.load_state(self.deps)["api"]["data"]["bandwidth_used_gb"])
 
 
 if __name__ == "__main__":

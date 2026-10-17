@@ -2189,134 +2189,155 @@ def _claim_and_store_order(deps, pending, order, result, foreground=True, notify
             "expiry": (api_data or {}).get("expiry") or cfg.get("valid_until")}
 
 
-def settle_once(deps, result, foreground=True, notify_event=None):
-    """Runs one settlement pass under the module lock. Returns a dict with 'done' (bool), 'kind',
-    'state', and item metadata."""
+def _settle_once_inner(deps, result, foreground=True, notify_event=None):
     finish_impl = None
     outcome_dict = None
-    with Lock(deps, wait=30):
-        pending = prune_pending(deps)
-        order = pending.get("order")
-        renewal = pending.get("renewal")
-        retained = pending.get("retained_orders") or []
-        if not order and not renewal and not retained:
-            if foreground:
-                raise ModuleError("E_NO_PENDING", "not_configured",
-                                  "no pending order or renewal to settle", EXIT_NOT_CONFIGURED)
-            return {"done": False, "kind": None, "state": "none"}
+    pending = prune_pending(deps)
+    order = pending.get("order")
+    renewal = pending.get("renewal")
+    retained = pending.get("retained_orders") or []
+    if not order and not renewal and not retained:
+        if foreground:
+            raise ModuleError("E_NO_PENDING", "not_configured",
+                              "no pending order or renewal to settle", EXIT_NOT_CONFIGURED)
+        return {"done": False, "kind": None, "state": "none"}, None
 
-        # 1. Active order
-        if isinstance(order, dict):
-            if order.get("state") == "needs_support":
+    # 1. Active order
+    if isinstance(order, dict):
+        if order.get("state") == "needs_support":
+            if foreground:
                 raise ModuleError(order.get("error_code") or "E_CLAIM_INVALID", "invalid_response",
                                   order.get("error_detail") or "order requires support", EXIT_INVALID_API)
-            if order.get("state") in ("awaiting_payment", "expired_unpaid"):
-                p_out, p_status, _p_doc, _p_det = poll_order_status(deps, order.get("payment_hash"))
-                if p_out == "ok" and p_status in ("paid", "claimed"):
-                    order["state"] = "paid"
-                    save_pending(deps, pending)
-                    if notify_event and not order.get("payment_notified"):
-                        order["payment_notified"] = True
-                        save_pending(deps, pending)
-                        notify_event("payment_received", order.get("payment_hash"))
-                elif p_out == "ok" and p_status == "expired" and not _item_protected_from_prune(order):
-                    order["state"] = "expired_unpaid"
-                    save_pending(deps, pending)
-            if order.get("state") in ("paid", "claiming"):
+            return {"done": False, "kind": "order", "state": "needs_support",
+                    "payment_hash": order.get("payment_hash")}, None
+        if order.get("state") in ("awaiting_payment", "expired_unpaid"):
+            p_out, p_status, _p_doc, _p_det = poll_order_status(deps, order.get("payment_hash"))
+            if p_out == "ok" and p_status in ("paid", "claimed"):
+                order["state"] = "paid"
+                save_pending(deps, pending)
                 if notify_event and not order.get("payment_notified"):
                     order["payment_notified"] = True
                     save_pending(deps, pending)
                     notify_event("payment_received", order.get("payment_hash"))
+            elif p_out == "ok" and p_status == "expired" and not _item_protected_from_prune(order):
+                order["state"] = "expired_unpaid"
+                save_pending(deps, pending)
+        if order.get("state") in ("paid", "claiming"):
+            if notify_event and not order.get("payment_notified"):
+                order["payment_notified"] = True
+                save_pending(deps, pending)
+                notify_event("payment_received", order.get("payment_hash"))
+            try:
                 outcome_dict = _claim_and_store_order(
                     deps, pending, order, result, foreground=foreground,
                     notify_event=notify_event, is_retained=False,
                 )
                 if outcome_dict.get("state") == "active":
                     finish_impl = outcome_dict.get("impl")
+            except ModuleError:
+                if foreground:
+                    raise
+                outcome_dict = {"done": False, "kind": "order", "state": order.get("state", "needs_support"),
+                                "payment_hash": order.get("payment_hash")}
 
-        # 2. Retained superseded orders
-        if outcome_dict is None:
-            for ret_order in list(retained):
-                if not isinstance(ret_order, dict) or ret_order.get("state") == "needs_support":
-                    continue
-                if ret_order.get("state") in ("awaiting_payment", "superseded", "expired_unpaid"):
-                    p_out, p_status, _p_doc, _p_det = poll_order_status(deps, ret_order.get("payment_hash"))
-                    if p_out == "ok" and p_status in ("paid", "claimed"):
-                        ret_order["state"] = "paid"
-                        save_pending(deps, pending)
-                if ret_order.get("state") in ("paid", "claiming"):
-                    if notify_event and not ret_order.get("payment_notified"):
-                        ret_order["payment_notified"] = True
-                        save_pending(deps, pending)
-                        notify_event("payment_received", ret_order.get("payment_hash"))
+    # 2. Retained superseded orders
+    if outcome_dict is None:
+        for ret_order in list(retained):
+            if not isinstance(ret_order, dict) or ret_order.get("state") == "needs_support":
+                continue
+            if ret_order.get("state") in ("awaiting_payment", "superseded", "expired_unpaid"):
+                p_out, p_status, _p_doc, _p_det = poll_order_status(deps, ret_order.get("payment_hash"))
+                if p_out == "ok" and p_status in ("paid", "claimed"):
+                    ret_order["state"] = "paid"
+                    save_pending(deps, pending)
+            if ret_order.get("state") in ("paid", "claiming"):
+                if notify_event and not ret_order.get("payment_notified"):
+                    ret_order["payment_notified"] = True
+                    save_pending(deps, pending)
+                    notify_event("payment_received", ret_order.get("payment_hash"))
+                try:
                     outcome_dict = _claim_and_store_order(
                         deps, pending, ret_order, result, foreground=foreground,
                         notify_event=notify_event, is_retained=True,
                     )
                     if outcome_dict.get("state") == "active":
                         finish_impl = outcome_dict.get("impl")
-                    break
+                except ModuleError:
+                    if foreground:
+                        raise
+                    outcome_dict = {"done": False, "kind": "order", "state": ret_order.get("state", "needs_support"),
+                                    "payment_hash": ret_order.get("payment_hash")}
+                break
 
-        # 3. Renewal
-        if outcome_dict is None and isinstance(renewal, dict):
-            if renewal.get("state") in ("awaiting_payment", "expired_unpaid"):
-                p_out, p_status, _p_doc, _p_det = poll_order_status(deps, renewal.get("payment_hash"))
-                if p_out == "ok" and p_status in ("paid", "claimed"):
-                    renewal["state"] = "paid"
-                    save_pending(deps, pending)
-                    if notify_event and not renewal.get("payment_notified"):
-                        renewal["payment_notified"] = True
-                        save_pending(deps, pending)
-                        notify_event("payment_received", renewal.get("payment_hash"))
-                elif p_out == "ok" and p_status == "expired" and not _item_protected_from_prune(renewal):
-                    renewal["state"] = "expired_unpaid"
-                    save_pending(deps, pending)
-            if renewal.get("state") == "paid":
+    # 3. Renewal
+    if outcome_dict is None and isinstance(renewal, dict):
+        if renewal.get("state") in ("awaiting_payment", "expired_unpaid"):
+            p_out, p_status, _p_doc, _p_det = poll_order_status(deps, renewal.get("payment_hash"))
+            if p_out == "ok" and p_status in ("paid", "claimed"):
+                renewal["state"] = "paid"
+                save_pending(deps, pending)
                 if notify_event and not renewal.get("payment_notified"):
                     renewal["payment_notified"] = True
                     save_pending(deps, pending)
                     notify_event("payment_received", renewal.get("payment_hash"))
-                s_out, s_data, _s_det = api_status(deps, renewal.get("public_key"))
-                old_dt = parse_iso(renewal.get("old_expiry"))
-                if old_dt is None and isinstance(renewal.get("old_expiry"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", renewal["old_expiry"]):
-                    old_dt = parse_iso(renewal["old_expiry"] + "T00:00:00Z")
-                new_dt = parse_iso((s_data or {}).get("expiry")) if s_out == "confirmed" else None
-                if s_out == "confirmed" and new_dt is not None and (old_dt is None or new_dt > old_dt):
-                    state = load_state(deps) or {}
-                    state["valid_until"] = s_data["expiry"]
-                    state["api"] = {"outcome": "confirmed", "checked_at": now_iso(deps),
-                                    "data": s_data, "confirmed_at": now_iso(deps)}
-                    if isinstance(state.get("notify_state"), dict):
-                        state["notify_state"]["expiry_cycle"] = s_data["expiry"]
-                        for ev in ("expiry_soon", "expired"):
-                            state["notify_state"].get("events", {}).pop(ev, None)
-                    save_state(deps, state)
-                    cfg = load_stored_config(deps)
-                    if cfg is not None:
-                        cfg["valid_until"] = s_data["expiry"]
-                        write_private(deps.path(CONF_FILE), render_wg_config(cfg))
-                    pending["renewal"] = None
-                    save_pending(deps, pending)
-                    outcome_dict = {
-                        "done": True, "kind": "renewal", "state": "confirmed",
-                        "renewal_id": renewal.get("renewal_id"), "payment_hash": renewal.get("payment_hash"),
-                        "old_expiry": renewal.get("old_expiry"), "new_expiry": s_data["expiry"],
-                        "expiry": s_data["expiry"],
-                    }
-                else:
-                    outcome_dict = {
-                        "done": False, "kind": "renewal", "state": "paid",
-                        "renewal_id": renewal.get("renewal_id"), "payment_hash": renewal.get("payment_hash"),
-                    }
+            elif p_out == "ok" and p_status == "expired" and not _item_protected_from_prune(renewal):
+                renewal["state"] = "expired_unpaid"
+                save_pending(deps, pending)
+        if renewal.get("state") == "paid":
+            if notify_event and not renewal.get("payment_notified"):
+                renewal["payment_notified"] = True
+                save_pending(deps, pending)
+                notify_event("payment_received", renewal.get("payment_hash"))
+            s_out, s_data, _s_det = api_status(deps, renewal.get("public_key"))
+            old_dt = parse_iso(renewal.get("old_expiry"))
+            if old_dt is None and isinstance(renewal.get("old_expiry"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", renewal["old_expiry"]):
+                old_dt = parse_iso(renewal["old_expiry"] + "T00:00:00Z")
+            new_dt = parse_iso((s_data or {}).get("expiry")) if s_out == "confirmed" else None
+            if s_out == "confirmed" and new_dt is not None and (old_dt is None or new_dt > old_dt):
+                state = load_state(deps) or {}
+                state["valid_until"] = s_data["expiry"]
+                state["api"] = {"outcome": "confirmed", "checked_at": now_iso(deps),
+                                "data": s_data, "confirmed_at": now_iso(deps)}
+                if isinstance(state.get("notify_state"), dict):
+                    state["notify_state"]["expiry_cycle"] = s_data["expiry"]
+                    for ev in ("expiry_soon", "expired"):
+                        (state["notify_state"].get("events") or {}).pop(ev, None)
+                save_state(deps, state)
+                cfg = load_stored_config(deps)
+                if cfg is not None:
+                    cfg["valid_until"] = s_data["expiry"]
+                    write_private(deps.path(CONF_FILE), render_wg_config(cfg))
+                pending["renewal"] = None
+                save_pending(deps, pending)
+                outcome_dict = {
+                    "done": True, "kind": "renewal", "state": "confirmed",
+                    "renewal_id": renewal.get("renewal_id"), "payment_hash": renewal.get("payment_hash"),
+                    "old_expiry": renewal.get("old_expiry"), "new_expiry": s_data["expiry"],
+                    "expiry": s_data["expiry"],
+                }
+            else:
+                outcome_dict = {
+                    "done": False, "kind": "renewal", "state": "paid",
+                    "renewal_id": renewal.get("renewal_id"), "payment_hash": renewal.get("payment_hash"),
+                }
 
-        if outcome_dict is None:
-            active_item = order or renewal or (retained[0] if retained else {})
-            kind = "order" if (order or retained) else "renewal"
-            outcome_dict = {
-                "done": False, "kind": kind, "state": active_item.get("state", "awaiting_payment"),
-                "payment_hash": active_item.get("payment_hash"),
-            }
+    if outcome_dict is None:
+        active_item = order or renewal or (retained[0] if retained else {})
+        kind = "order" if (order or retained) else "renewal"
+        outcome_dict = {
+            "done": False, "kind": kind, "state": active_item.get("state", "awaiting_payment"),
+            "payment_hash": active_item.get("payment_hash"),
+        }
+    return outcome_dict, finish_impl
 
+
+def settle_once(deps, result, foreground=True, notify_event=None, use_lock=True):
+    """Runs one settlement pass. Returns a dict with 'done' (bool), 'kind', 'state', and item metadata."""
+    if use_lock:
+        with Lock(deps, wait=30):
+            outcome_dict, finish_impl = _settle_once_inner(deps, result, foreground=foreground, notify_event=notify_event)
+    else:
+        outcome_dict, finish_impl = _settle_once_inner(deps, result, foreground=foreground, notify_event=notify_event)
     if finish_impl is not None:
         finish_with_check(deps, result, wait_until_started(deps, UNITS[finish_impl]))
         outcome_dict["verdict"] = result.fields.get("verdict")
@@ -2513,8 +2534,24 @@ def cmd_status(deps, args, result):
         "sync": {"outcome": outcome, "last_outcome": api.get("outcome"), "confirmed_at": api.get("confirmed_at")},
         "tunnel": wg_local(deps), "last_check": state.get("last_check"),
         "guard": {k: (record or {}).get(k) for k in ("decision", "reason", "decided_at")},
-        "notify_state": None,
+        "notify_state": state.get("notify_state"),
     }
+    if getattr(args, "raw_api", False):
+        raw_api = {
+            "expiry": data.get("expiry") or state.get("valid_until"),
+            "bandwidth_used_gb": data.get("bandwidth_used_gb"),
+            "bandwidth_limit_gb": data.get("bandwidth_limit_gb"),
+            "bandwidth_resets_this_month": data.get("resets_this_month"),
+            "max_resets_per_month": data.get("max_resets_per_month"),
+            "status": data.get("peer_status"),
+            "server_domain": data.get("server_domain") or state.get("server_domain"),
+            "vpn_port": data.get("vpn_port") if data.get("vpn_port") is not None else state.get("vpn_port"),
+            "last_synced_at": data.get("last_synced_at"),
+        }
+        fields["raw_api"] = raw_api
+        fields["status"] = raw_api["status"]
+        fields["bandwidth_resets_this_month"] = raw_api["bandwidth_resets_this_month"]
+        fields["last_synced_at"] = raw_api["last_synced_at"]
     if live_port is not None and live_port != state.get("vpn_port"):
         fields["port_changed"] = True
         fields["action"] = "server port changed: REPAIR (restarts Lightning)"
@@ -3418,6 +3455,7 @@ def cmd_repair(deps, args, result):
             managed = False
         if not managed:
             state["impl"] = impl
+            state["activation_pending"] = False
             activate(deps, impl, result, stored_writer=lambda: save_state(deps, state))
             actions.append("install")
             if was_active and unit_props(deps, unit, "ActiveState")["ActiveState"] != "active":
@@ -3476,6 +3514,85 @@ def cmd_subscriptions_list(deps, args, result):
     result.fields["subscriptions"] = items
 
 
+NOTIFY_MESSAGES = {
+    "payment_received": "TunnelSats: payment received. Claiming and activating your subscription.",
+    "activation_done": "TunnelSats: tunnel active. Clearnet connections now route through TunnelSats.",
+    "expiry_soon": "TunnelSats: subscription expires soon (within 72 hours). Renew in the SSH menu > SUBSCRIBE > TunnelSats.",
+    "expired": "TunnelSats: subscription expired. Renew in the SSH menu > SUBSCRIBE > TunnelSats.",
+    "bandwidth_high": "TunnelSats: monthly bandwidth high (80% or more used). Check status in the SSH menu.",
+    "bandwidth_exhausted": "TunnelSats: monthly bandwidth exhausted or peer disabled. Top up or renew in the SSH menu.",
+    "verdict_degraded": "TunnelSats: connection status is DEGRADED (clearnet traffic is blocked by the kill switch while the tunnel recovers).",
+    "verdict_unsafe": "TunnelSats: connection status is UNSAFE. Run CHECK or REPAIR in the SSH menu > SUBSCRIBE > TunnelSats.",
+    "all_clear": "TunnelSats: connection status is protected again.",
+    "restart_needed": RESTART_MESSAGE,
+}
+
+
+def empty_notify_state():
+    return {
+        "expiry_cycle": None,
+        "bandwidth_cycle": None,
+        "last_verdict": "protected",
+        "verdict_seq": 0,
+        "verdict_warning_handed_off": False,
+        "daily": {"date": None, "count": 0},
+        "events": {},
+        "last_event": None,
+        "outcome": None,
+    }
+
+
+def _ensure_notify_state(state):
+    raw = (state or {}).get("notify_state")
+    base = empty_notify_state()
+    if isinstance(raw, dict):
+        for k in ("expiry_cycle", "bandwidth_cycle", "last_verdict", "verdict_seq",
+                  "verdict_warning_handed_off", "last_event", "outcome"):
+            if k in raw:
+                base[k] = raw[k]
+        if isinstance(raw.get("daily"), dict):
+            base["daily"] = {"date": raw["daily"].get("date"), "count": int(raw["daily"].get("count") or 0)}
+        if isinstance(raw.get("events"), dict):
+            base["events"] = {k: dict(v) for k, v in raw["events"].items() if isinstance(v, dict)}
+    return base
+
+
+def send_event_notification(deps, conf, nstate, event, cycle_key, now_dt=None):
+    """Sends a deduplicated event notification via blitz.notify.sh send."""
+    now_dt = now_dt or deps.clock()
+    events = nstate.setdefault("events", {})
+    record = events.get(event)
+    if not isinstance(record, dict) or record.get("cycle") != cycle_key:
+        record = {"cycle": cycle_key, "attempts": 0, "outcome": None}
+    if record.get("outcome") in ("handed_off", "skipped_disabled", "dropped", "capped"):
+        return None
+    is_verdict_event = event in ("verdict_degraded", "verdict_unsafe", "all_clear")
+    today = now_dt.strftime("%Y-%m-%d")
+    daily = nstate.setdefault("daily", {"date": today, "count": 0})
+    if daily.get("date") != today:
+        daily["date"] = today
+        daily["count"] = 0
+    if is_verdict_event and int(daily.get("count") or 0) >= 10:
+        record["outcome"] = "capped"
+    elif conf.get("notify") != "on":
+        record["outcome"] = "skipped_disabled"
+    else:
+        record["attempts"] += 1
+        if is_verdict_event:
+            daily["count"] = int(daily.get("count") or 0) + 1
+        rc, _out, _err = deps.run([NOTIFY, "send", NOTIFY_MESSAGES[event]], timeout=60)
+        if rc == 0:
+            record["outcome"] = "handed_off"
+        else:
+            record["outcome"] = "failed" if record["attempts"] < 3 else "dropped"
+    record["updated_at"] = iso(now_dt)
+    events[event] = record
+    nstate["last_event"] = event
+    nstate["outcome"] = record["outcome"]
+    deps.log("notify event=%s outcome=%s attempt=%d" % (event, record["outcome"], record["attempts"]))
+    return {"event": event, "outcome": record["outcome"], "attempt": record["attempts"]}
+
+
 def notify(deps, conf, state, invocation):
     """The restart notice, once per Lightning start (invocation). Returns the notification entry."""
     record = state.get("notify") or {}
@@ -3499,8 +3616,70 @@ def notify(deps, conf, state, invocation):
     return {"event": "restart_needed", "outcome": record["outcome"], "attempt": record["attempts"]}
 
 
+def _tick_live_verdict(deps, impl, props):
+    """Evaluates the live kernel verdict via verify --no-probe --json."""
+    rc, verify = its(deps, ["verify", "--no-probe", "--json"], timeout=ITS_TIMEOUT["verify_no_probe"])
+    if verify is None:
+        return "unsafe"
+    if rc == 0 or verify.get("verdict") == "protected":
+        return "protected"
+    if rc == 4 or verify.get("verdict") == "unsafe":
+        return "unsafe"
+    checks = [c for c in (verify.get("checks") or []) if isinstance(c, dict)]
+    failed = []
+    for c in checks:
+        if c.get("result") != "fail":
+            continue
+        if (c.get("id") == "ln_membership" and props.get("ActiveState") == "active"
+                and "is activating" in str(c.get("detail") or "")):
+            continue
+        failed.append(c)
+    if not failed and rc == 5:
+        return "protected"
+    if any(c.get("class") == "unsafe" for c in failed):
+        return "unsafe"
+    return "degraded" if rc in (3, 5) or verify.get("verdict") == "degraded" else "unsafe"
+
+
+def _load_status_file(deps, path):
+    try:
+        with open(deps.path(path), "rb") as handle:
+            raw = handle.read(API_MAX_BYTES + 1)
+    except OSError:
+        raise ModuleError("E_API_INVALID", "invalid_response", "cannot read --status-file", EXIT_INVALID_API) from None
+    if not raw or len(raw) > API_MAX_BYTES:
+        raise ModuleError("E_API_INVALID", "invalid_response", "--status-file is empty or too large", EXIT_INVALID_API)
+    try:
+        doc = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        raise ModuleError("E_API_INVALID", "invalid_response", "--status-file is not valid JSON", EXIT_INVALID_API) from None
+    validated = validate_status(doc)
+    if validated is None and isinstance(doc, dict) and isinstance(doc.get("raw_api"), dict):
+        validated = validate_status(doc["raw_api"])
+    if validated is None:
+        raise ModuleError("E_API_INVALID", "invalid_response", "--status-file failed status validation", EXIT_INVALID_API)
+    return validated
+
+
 def cmd_tick(deps, args, result):
-    result.fields.update({"restart_needed": False, "notifications": [], "test_hook": None})
+    now_arg = getattr(args, "now", None)
+    status_file_arg = getattr(args, "status_file", None)
+    no_persist = bool(getattr(args, "no_persist", False))
+    if (now_arg is not None or status_file_arg is not None) and not no_persist:
+        raise ModuleError("E_USAGE", "usage", "--now and --status-file require --no-persist", EXIT_USAGE)
+    is_test_hook = bool(now_arg is not None or status_file_arg is not None or no_persist)
+    now_dt = deps.clock()
+    if now_arg is not None:
+        now_dt = parse_iso(now_arg)
+        if now_dt is None:
+            raise ModuleError("E_USAGE", "usage", "--now must be an ISO-8601 UTC timestamp", EXIT_USAGE)
+        deps.log("tick test_hook now=%s no_persist=true" % now_arg)
+    override_api_data = None
+    if status_file_arg is not None:
+        override_api_data = _load_status_file(deps, status_file_arg)
+        deps.log("tick test_hook status_file=%s no_persist=true" % status_file_arg)
+
+    result.fields.update({"restart_needed": False, "notifications": [], "test_hook": True if is_test_hook else None})
     try:
         lock = Lock(deps, wait=0).__enter__()
     except ModuleError:
@@ -3509,25 +3688,147 @@ def cmd_tick(deps, args, result):
     try:
         conf = read_rb_conf(deps)
         state = load_state(deps)
+        nstate = _ensure_notify_state(state)
+        state_dirty = False
+
+        if not is_test_hook:
+            pending = load_pending(deps)
+            if pending.get("order") or pending.get("renewal") or pending.get("retained_orders"):
+                def on_settle_notify(ev, cycle_key):
+                    nonlocal state_dirty
+                    entry = send_event_notification(deps, conf, nstate, ev, cycle_key, now_dt=now_dt)
+                    if entry:
+                        result.fields["notifications"].append(entry)
+                        state_dirty = True
+                        cur_st = load_state(deps)
+                        if cur_st is not None:
+                            cur_st["notify_state"] = dict(nstate)
+                            save_state(deps, cur_st)
+
+                settle_res = settle_once(deps, result, foreground=False, notify_event=on_settle_notify, use_lock=False)
+                result.fields["settle"] = {k: v for k, v in settle_res.items() if k != "done"}
+                conf = read_rb_conf(deps)
+                state = load_state(deps)
+                if state is not None and state_dirty:
+                    state["notify_state"] = dict(nstate)
+                    save_state(deps, state)
+
         if conf.get("tunnelsats") != "on" or not state:
             return
         impl = state.get("impl") or conf.get("tunnelsatsImpl")
         if impl not in IMPLS:
             return
-        props = unit_props(deps, UNITS[impl], "ActiveState", "InvocationID")
-        record = read_guard_record(deps, BASES[impl])
-        if props["ActiveState"] != "active" or not record or not props["InvocationID"] or \
-                record.get("invocation_id") != props["InvocationID"]:
-            return
-        if record.get("decision") not in ("tor-only", "hybrid") or record.get("reason") not in RESTARTABLE:
-            return
-        rc, dry = its(deps, ["guard", impl, "mainnet", "--dry-run", "--json"], timeout=ITS_TIMEOUT["guard_dry_run"])
-        if not dry or dry.get("decision") != "hybrid" or (impl == "cl" and dry.get("reason") != "ok"):
-            return
-        result.fields["restart_needed"] = True
-        entry = notify(deps, conf, state, props["InvocationID"])
-        if entry:
-            result.fields["notifications"].append(entry)
+
+        # 6-hour status sync when not in a synthetic test hook
+        if not is_test_hook and override_api_data is None and state.get("public_key"):
+            api = state.get("api") or {}
+            checked_dt = parse_iso(api.get("checked_at"))
+            if checked_dt is None or (now_dt - checked_dt).total_seconds() > API_CACHE_SECONDS:
+                s_out, s_data, _s_det = api_status(deps, state["public_key"])
+                api["outcome"] = s_out
+                api["checked_at"] = iso(now_dt)
+                if s_out == "confirmed":
+                    api["data"] = s_data
+                    api["confirmed_at"] = iso(now_dt)
+                    state["valid_until"] = s_data["expiry"]
+                state["api"] = api
+                state_dirty = True
+
+        # Expiry and bandwidth notifications
+        api_data = override_api_data if override_api_data is not None else ((state.get("api") or {}).get("data") or {})
+        expiry_str = api_data.get("expiry") or state.get("valid_until")
+        expiry_dt = parse_iso(expiry_str)
+        if expiry_str and nstate.get("expiry_cycle") != expiry_str:
+            nstate["expiry_cycle"] = expiry_str
+            nstate["events"].pop("expiry_soon", None)
+            nstate["events"].pop("expired", None)
+            state_dirty = True
+        if expiry_dt is not None:
+            rem_s = (expiry_dt - now_dt).total_seconds()
+            if rem_s <= 0:
+                entry = send_event_notification(deps, conf, nstate, "expired", expiry_str, now_dt=now_dt)
+                if entry:
+                    result.fields["notifications"].append(entry)
+                    state_dirty = True
+            elif rem_s <= 72 * 3600:
+                entry = send_event_notification(deps, conf, nstate, "expiry_soon", expiry_str, now_dt=now_dt)
+                if entry:
+                    result.fields["notifications"].append(entry)
+                    state_dirty = True
+
+        if api_data:
+            used = api_data.get("bandwidth_used_gb")
+            limit = api_data.get("bandwidth_limit_gb")
+            peer_status = api_data.get("peer_status")
+            bw_cycle = "%s:%s" % (expiry_str or "", api_data.get("resets_this_month", 0))
+            if nstate.get("bandwidth_cycle") != bw_cycle:
+                nstate["bandwidth_cycle"] = bw_cycle
+                nstate["events"].pop("bandwidth_high", None)
+                nstate["events"].pop("bandwidth_exhausted", None)
+                state_dirty = True
+            if peer_status == "disabled" or (is_number(used) and is_number(limit) and limit > 0 and used >= limit):
+                entry = send_event_notification(deps, conf, nstate, "bandwidth_exhausted", bw_cycle, now_dt=now_dt)
+                if entry:
+                    result.fields["notifications"].append(entry)
+                    state_dirty = True
+            elif is_number(used) and is_number(limit) and limit > 0 and (used / float(limit)) >= 0.80:
+                entry = send_event_notification(deps, conf, nstate, "bandwidth_high", bw_cycle, now_dt=now_dt)
+                if entry:
+                    result.fields["notifications"].append(entry)
+                    state_dirty = True
+            elif is_number(used) and is_number(limit) and limit > 0 and (used / float(limit)) < 0.80 and peer_status == "enabled":
+                if "bandwidth_high" in nstate["events"] or "bandwidth_exhausted" in nstate["events"]:
+                    nstate["events"].pop("bandwidth_high", None)
+                    nstate["events"].pop("bandwidth_exhausted", None)
+                    state_dirty = True
+
+        if not is_test_hook:
+            props = unit_props(deps, UNITS[impl], "ActiveState", "InvocationID")
+            record = read_guard_record(deps, BASES[impl])
+            if (props["ActiveState"] == "active" and record and props["InvocationID"]
+                    and record.get("invocation_id") == props["InvocationID"]
+                    and record.get("decision") in ("tor-only", "hybrid")
+                    and record.get("reason") in RESTARTABLE):
+                rc, dry = its(deps, ["guard", impl, "mainnet", "--dry-run", "--json"], timeout=ITS_TIMEOUT["guard_dry_run"])
+                if dry and dry.get("decision") == "hybrid" and (impl != "cl" or dry.get("reason") == "ok"):
+                    result.fields["restart_needed"] = True
+                    entry = notify(deps, conf, state, props["InvocationID"])
+                    if entry:
+                        result.fields["notifications"].append(entry)
+                        state_dirty = True
+
+            if not result.fields["restart_needed"]:
+                live_verdict = _tick_live_verdict(deps, impl, props)
+                prev_verdict = nstate.get("last_verdict") or "protected"
+                if live_verdict in ("degraded", "unsafe"):
+                    ev_name = "verdict_%s" % live_verdict
+                    if prev_verdict != live_verdict:
+                        nstate["verdict_seq"] = int(nstate.get("verdict_seq") or 0) + 1
+                        nstate["last_verdict"] = live_verdict
+                        state_dirty = True
+                    v_cycle = "v:%d:%s" % (int(nstate.get("verdict_seq") or 1), live_verdict)
+                    entry = send_event_notification(deps, conf, nstate, ev_name, v_cycle, now_dt=now_dt)
+                    if entry:
+                        result.fields["notifications"].append(entry)
+                        if entry["outcome"] == "handed_off":
+                            nstate["verdict_warning_handed_off"] = True
+                        state_dirty = True
+                elif live_verdict == "protected":
+                    if prev_verdict != "protected":
+                        nstate["verdict_seq"] = int(nstate.get("verdict_seq") or 0) + 1
+                        nstate["last_verdict"] = "protected"
+                        state_dirty = True
+                    if nstate.get("verdict_warning_handed_off"):
+                        v_cycle = "clear:%d" % int(nstate.get("verdict_seq") or 1)
+                        entry = send_event_notification(deps, conf, nstate, "all_clear", v_cycle, now_dt=now_dt)
+                        if entry:
+                            result.fields["notifications"].append(entry)
+                            if entry["outcome"] in ("handed_off", "skipped_disabled", "dropped", "capped"):
+                                nstate["verdict_warning_handed_off"] = False
+                            state_dirty = True
+
+        if state_dirty and not no_persist:
+            state["notify_state"] = nstate
             save_state(deps, state)
     finally:
         lock.__exit__(None, None, None)
@@ -3547,8 +3848,7 @@ VPN. Peers see the VPN server's address, never your home IP.
 - TunnelSats sees your home IP (as the VPN client) and your WireGuard public
   key. Your private key never leaves this node.
 
-Buy a subscription on tunnelsats.com, then use IMPORT with the downloaded
-WireGuard config."""
+Buy a subscription in the menu (BUY) or on tunnelsats.com (IMPORT)."""
 
 VERDICT_TEXT = {"protected": "Protected", "degraded": "Clearnet paused, Tor peers keep working",
                 "unsafe": "Action needed", "not_configured": "Not set up"}
@@ -3581,8 +3881,12 @@ def menu_choices(deps, state, conf, found=None):
     while TunnelSats is on: the start guard then audits the config at rest before Lightning runs.
     With TunnelSats off (after REMOVE) nothing would, so this menu never starts Lightning then;
     after a refused REMOVE it shows what keeps Lightning stopped and offers REMOVE again."""
+    pending_store = load_pending(deps)
     if state is None:
-        choices = [("IMPORT", "Import a WireGuard config (bought on tunnelsats.com)")]
+        choices = [("BUY", "Buy a new TunnelSats subscription"),
+                   ("IMPORT", "Import a WireGuard config (bought on tunnelsats.com)")]
+        if pending_store.get("order") or pending_store.get("retained_orders"):
+            choices.insert(1, ("RESUME", "Resume pending subscription order"))
         if (found or {}).get("adopt_available"):
             choices.append(("ADOPT", "Take over the existing TunnelSats setup"))
         choices.append(("ABOUT", "How it works, privacy trade-offs"))
@@ -3592,13 +3896,20 @@ def menu_choices(deps, state, conf, found=None):
     pending = state.get("remove_pending")
     notice = None
     remove = ("REMOVE", "Remove TunnelSats from this node")
-    if not active_ts and isinstance(pending, dict) and pending.get("unit") in UNITS.values():
+    has_remove_pending = not active_ts and isinstance(pending, dict) and pending.get("unit") in UNITS.values()
+    if has_remove_pending:
         notice = pending_removal_text(deps, pending)
         remove = ("REMOVE", "Remove again: check the config, then start Lightning")
-    choices = [("STATUS", "Subscription and tunnel status"), ("CHECK", "Connection check"),
-               ("REPAIR", "Re-apply TunnelSats (also: update the pinned tool)"), remove]
+    choices = [("STATUS", "Subscription and tunnel status"), ("CHECK", "Connection check")]
+    if not has_remove_pending:
+        choices.append(("RENEW", "Extend the current subscription"))
+        if pending_store.get("renewal"):
+            choices.append(("RESUME", "Resume pending renewal"))
+        if state.get("activation_pending"):
+            choices.append(("ACTIVATE", "Finish activating claimed subscription"))
     if state.get("mode") == "adopted_legacy":
-        choices.insert(2, ("UPGRADE", "Upgrade the adopted setup to managed mode"))
+        choices.append(("UPGRADE", "Upgrade the adopted setup to managed mode"))
+    choices.extend([("REPAIR", "Re-apply TunnelSats (also: update the pinned tool)"), remove])
     if active_ts and state.get("mode") != "adopted_legacy" and impl in UNITS:
         if unit_props(deps, UNITS[impl], "ActiveState")["ActiveState"] != "active":
             choices.append(("START", "Start Lightning"))
@@ -3676,6 +3987,7 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
     d = Dialog(dialog="dialog", autowidgetsize=True)
     d.set_background_title("TunnelSats VPN")
     found = None
+    duration_choices = [("1", "1 month"), ("3", "3 months"), ("6", "6 months"), ("12", "12 months")]
     while True:
         state = load_state(deps)
         conf = read_rb_conf(deps)
@@ -3693,6 +4005,71 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
             return
         if tag == "ABOUT":
             d.msgbox(ABOUT_TEXT, title="About TunnelSats", width=80, height=22)
+        elif tag == "BUY":
+            srv_doc = menu_run(deps, ["servers"])
+            srv_choices = [(s["id"], "%s %s - %s" % (s.get("flag", ""), s["country"], s["city"]))
+                           for s in (srv_doc.get("servers") or []) if s.get("status") == "active"]
+            if not srv_choices:
+                d.msgbox("No active TunnelSats servers available right now.", title="BUY", width=60, height=8)
+                continue
+            code, server_id = d.menu("Choose a VPN server location:", choices=srv_choices,
+                                     width=70, height=16, title="BUY")
+            if code != d.OK:
+                continue
+            code, months = d.menu("Choose subscription duration:", choices=duration_choices,
+                                  width=60, height=12, title="BUY")
+            if code != d.OK:
+                continue
+            os.system("clear")
+            print("# TunnelSats: creating subscription invoice ...")
+            doc = menu_run(deps, ["buy", "--server", server_id, "--months", months, "--pay", "qr"])
+            if not doc["ok"]:
+                d.msgbox(result_text(doc), title="BUY", width=78, height=20)
+                continue
+            inv_doc = menu_run(deps, ["invoice", "--kind", "order"])
+            if inv_doc.get("invoice"):
+                show_qr(deps, inv_doc["invoice"])
+                print("\nBOLT11: %s\n" % inv_doc["invoice"])
+                print("# Waiting for payment (up to 5 minutes; background timer also settles automatically) ...")
+                settle_doc = menu_run(deps, ["settle", "--wait", "300"])
+                hide_qr(deps)
+                d.msgbox(result_text(settle_doc), title="BUY", width=78, height=20)
+        elif tag == "RENEW":
+            code, months = d.menu("Choose renewal duration:", choices=duration_choices,
+                                  width=60, height=12, title="RENEW")
+            if code != d.OK:
+                continue
+            os.system("clear")
+            print("# TunnelSats: creating renewal invoice ...")
+            doc = menu_run(deps, ["renew", "--months", months, "--pay", "qr"])
+            if not doc["ok"]:
+                d.msgbox(result_text(doc), title="RENEW", width=78, height=20)
+                continue
+            inv_doc = menu_run(deps, ["invoice", "--kind", "renewal"])
+            if inv_doc.get("invoice"):
+                show_qr(deps, inv_doc["invoice"])
+                print("\nBOLT11: %s\n" % inv_doc["invoice"])
+                print("# Waiting for payment (up to 5 minutes) ...")
+                settle_doc = menu_run(deps, ["settle", "--wait", "300"])
+                hide_qr(deps)
+                d.msgbox(result_text(settle_doc), title="RENEW", width=78, height=20)
+        elif tag == "RESUME":
+            pending_store = load_pending(deps)
+            kind = "order" if (pending_store.get("order") or pending_store.get("retained_orders")) else "renewal"
+            inv_doc = menu_run(deps, ["invoice", "--kind", kind])
+            if inv_doc.get("invoice"):
+                os.system("clear")
+                show_qr(deps, inv_doc["invoice"])
+                print("\nBOLT11: %s\n" % inv_doc["invoice"])
+                print("# Checking and waiting for settlement ...")
+            settle_doc = menu_run(deps, ["settle", "--wait", "300"])
+            hide_qr(deps)
+            d.msgbox(result_text(settle_doc), title="RESUME", width=78, height=20)
+        elif tag == "ACTIVATE":
+            os.system("clear")
+            print("# TunnelSats: activating claimed subscription ...")
+            doc = menu_run(deps, ["repair", "--yes"])
+            d.msgbox(result_text(doc), title="ACTIVATE", width=78, height=20)
         elif tag == "IMPORT":
             code, path = d.inputbox("Path of the WireGuard config file to import:", init="/home/admin/tunnelsats.conf",
                                     width=70, height=10, title="IMPORT")
@@ -3860,6 +4237,7 @@ def build_parser():
     group = p.add_mutually_exclusive_group()
     group.add_argument("--refresh", action="store_true")
     group.add_argument("--cached", action="store_true")
+    p.add_argument("--raw-api", action="store_true")
     verb("check")
     verb("detect")
     p = verb("repair")
@@ -3869,14 +4247,17 @@ def build_parser():
     p.add_argument("--yes", action="store_true")
     p.add_argument("--purge", action="store_true")
     verb("subscriptions-list")
-    verb("tick")
+    p = verb("tick")
+    p.add_argument("--now")
+    p.add_argument("--status-file")
+    p.add_argument("--no-persist", action="store_true")
     return parser
 
 
 def main(argv=None, deps=None, out=None):
     argv = sys.argv[1:] if argv is None else argv
     deps = deps or Deps()
-    as_json = "--json" in argv
+    as_json = "--json" in argv or "--raw-api" in argv
     verb = next((a for a in argv if not a.startswith("-")), "")
     result = Result(verb or "usage")
     if argv in (["-h"], ["--help"]):
