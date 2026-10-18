@@ -2703,6 +2703,33 @@ class TestBuyAndRenew(ModuleTestCase):
         doc2 = self.run_verb("renew", "--months", "1", "--pay", "none")
         self.assertEqual((0, True, []), (doc2["exit_code"], doc2["reused"], self.fake.http_calls))
 
+    def test_buy_refuses_to_supersede_a_processing_order(self):
+        # HTTP 202 on the order poll: paid, the API still provisions it; never replaced by a new order
+        ph = "1" * 64
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "orderId": "ord-101", "paymentHash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph, expiry=3600),
+            "amountSats": 25000}).encode())]
+        self.assertEqual(0, self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")["exit_code"])
+        self.fake.http_responses = [(202, {}, fixture("api", "order_processing.json").encode())]
+        doc = self.run_verb("buy", "--server", "eu-de", "--months", "3", "--pay", "none")
+        self.assertEqual((14, "E_ORDER_PENDING"), (doc["exit_code"], doc["error"]))
+        pending = mod.load_pending(self.deps)
+        self.assertEqual(("paid", ph, []), (pending["order"]["state"], pending["order"]["payment_hash"],
+                                            pending["retained_orders"]))
+
+    def test_renew_refuses_to_replace_a_processing_renewal(self):
+        self.store()
+        ph = "4" * 64
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "renewalId": "ren-1", "paymentHash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph, expiry=3600),
+        }).encode())]
+        self.assertEqual(0, self.run_verb("renew", "--months", "1", "--pay", "none")["exit_code"])
+        self.fake.http_responses = [(202, {}, fixture("api", "order_processing.json").encode())]
+        doc = self.run_verb("renew", "--months", "3", "--pay", "none")
+        self.assertEqual((14, "E_RENEWAL_PENDING"), (doc["exit_code"], doc["error"]))
+        self.assertEqual(("paid", ph), (mod.load_pending(self.deps)["renewal"]["state"],
+                                        mod.load_pending(self.deps)["renewal"]["payment_hash"]))
+
 
 class TestInvoiceAndPending(ModuleTestCase):
     def test_invoice_qr_png_expiry_and_pending_redaction(self):
@@ -2736,36 +2763,38 @@ class TestInvoiceAndPending(ModuleTestCase):
 
 class TestClaimAndSettle(ModuleTestCase):
     def valid_claim_doc(self, pub=ALICE_PUB):
-        return {
-            "peer": {
-                "publicKey": pub,
-                "ip": "10.9.0.42/32",
-                "presharedKey": BOB_PUB,
-                "vpnPort": 24556,
-            },
-            "server": {
-                "publicKey": BOB_PUB,
-                "endpoint": "de2.tunnelsats.com:51820",
-                "allowedIPs": "0.0.0.0/0",
-                "persistentKeepalive": 25,
-            },
-            "subscriptionEnd": "2026-12-01T00:00:00Z",
-            "fullConfig": "[Interface]\nPrivateKey = EVIL_SERVER_KEY\n",
-        }
+        """The 200 claim body of the API (fixtures/api/claim_client_held.json), plus a hostile fullConfig
+        that the trust boundary must never read."""
+        doc = fixture_json("api", "claim_client_held.json")
+        doc["peer"]["publicKey"] = pub
+        doc["fullConfig"] = "[Interface]\nPrivateKey = EVIL_SERVER_KEY\n"
+        return doc
 
     def test_assemble_claimed_config_trust_boundary(self):
         cfg = mod.assemble_claimed_config(self.valid_claim_doc(), ALICE_PRIV, ALICE_PUB)
         self.assertEqual((ALICE_PRIV, ALICE_PUB, "de2.tunnelsats.com", 24556, "2026-12-01T00:00:00Z"),
                          (cfg["private_key"], cfg["public_key"], cfg["endpoint_host"], cfg["vpn_port"], cfg["valid_until"]))
+        # The API's allowedIPs (with ::/0) and its bare peer.address end up in the canonical config
+        self.assertEqual((["0.0.0.0/0", "::/0"], ["10.9.0.42/32"]), (cfg["allowed_ips"], cfg["addresses"]))
+        ipv4_only = dict(self.valid_claim_doc(), server=dict(self.valid_claim_doc()["server"], allowedIPs="0.0.0.0/0"))
+        self.assertEqual(["0.0.0.0/0"], mod.assemble_claimed_config(ipv4_only, ALICE_PRIV, ALICE_PUB)["allowed_ips"])
 
-        # Rejects mismatched peer.publicKey, bad IP, non-tunnelsats host, missing 0.0.0.0/0, bad port
+        # Rejects mismatched peer.publicKey, bad or missing address (including the undocumented name 'ip'),
+        # non-tunnelsats host, allowedIPs without 0.0.0.0/0 or with an invalid entry, bad port, bad date
+        peer, server = self.valid_claim_doc()["peer"], self.valid_claim_doc()["server"]
+        no_address = {k: v for k, v in peer.items() if k != "address"}
         bad_cases = [
-            {"peer": dict(self.valid_claim_doc()["peer"], publicKey=BOB_PUB)},
-            {"peer": dict(self.valid_claim_doc()["peer"], ip="192.168.1.1/32")},
-            {"peer": dict(self.valid_claim_doc()["peer"], ip="10.9.0.0/24")},
-            {"peer": dict(self.valid_claim_doc()["peer"], vpnPort=70000)},
-            {"server": dict(self.valid_claim_doc()["server"], endpoint="evil.example.com:51820")},
-            {"server": dict(self.valid_claim_doc()["server"], allowedIPs="10.0.0.0/8")},
+            {"peer": dict(peer, publicKey=BOB_PUB)},
+            {"peer": dict(peer, address="192.168.1.1")},
+            {"peer": dict(peer, address="10.9.0.0/24")},
+            {"peer": no_address},
+            {"peer": dict(no_address, ip="10.9.0.42/32")},
+            {"vpnPort": 70000},
+            {"vpnPort": None, "peer": dict(peer, vpnPort=24556)},
+            {"server": dict(server, endpoint="evil.example.com:51820")},
+            {"server": dict(server, allowedIPs="10.0.0.0/8")},
+            {"server": dict(server, allowedIPs="::/0")},
+            {"server": dict(server, allowedIPs="0.0.0.0/0, ::/0, not-a-network")},
             {"subscriptionEnd": "not-a-date"},
         ]
         for patch in bad_cases:
@@ -2827,6 +2856,69 @@ class TestClaimAndSettle(ModuleTestCase):
         self.assertEqual((12, "E_CLAIM_CONFLICT"), (doc["exit_code"], doc["error"]))
         saved = mod.load_pending(self.deps)["order"]
         self.assertEqual("needs_support", saved["state"])
+
+    def order_record(self, ph, state):
+        return {
+            "order_id": "ord-%s" % ph[:4], "payment_hash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph),
+            "amount_sats": 25000, "server_id": "de2", "months": 1, "impl": "lnd",
+            "private_key": ALICE_PRIV, "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T13:00:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": state,
+            "node_payment": {"state": "none", "result": None},
+        }
+
+    def test_settle_claim_202_keeps_claiming_then_activates(self):
+        # Right after a node payment the claim can race the API's own provisioning (HTTP 202,
+        # "retry the claim"): the order stays in claiming and the next settle pass activates it
+        self.record()
+        ph = "8" * 64
+        pending = mod.empty_pending()
+        pending["order"] = self.order_record(ph, "paid")
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [(202, {}, fixture("api", "claim_processing.json").encode())]
+        doc = self.run_verb("settle")
+        self.assertEqual((11, "claiming", True), (doc["exit_code"], doc["state"], doc["retryable"]))
+        saved = mod.load_pending(self.deps)["order"]
+        self.assertEqual(("claiming", None, ALICE_PRIV), (saved["state"], saved.get("error_code"), saved["private_key"]))
+        self.assertIsNone(mod.load_state(self.deps))
+
+        self.fake.http_responses = [
+            (200, {}, json.dumps(self.valid_claim_doc()).encode()),
+            (200, {}, fixture("api", "status_enabled.json").encode()),
+        ]
+        doc2 = self.run_verb("settle")
+        self.assertEqual((0, "active", "protected"), (doc2["exit_code"], doc2["state"], doc2["verdict"]))
+        self.assertIsNone(mod.load_pending(self.deps)["order"])
+        self.assertEqual((["0.0.0.0/0", "::/0"], ["10.9.0.42/32"], 24556),
+                         (mod.load_stored_config(self.deps)["allowed_ips"], mod.load_stored_config(self.deps)["addresses"],
+                          mod.load_stored_config(self.deps)["vpn_port"]))
+
+    def test_settle_claim_402_keeps_claiming(self):
+        ph = "8" * 64
+        pending = mod.empty_pending()
+        pending["order"] = self.order_record(ph, "paid")
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [(402, {}, fixture("api", "error_payment_not_confirmed.json").encode())]
+        doc = self.run_verb("settle")
+        self.assertEqual((11, "claiming", True), (doc["exit_code"], doc["state"], doc["retryable"]))
+        self.assertEqual("claiming", mod.load_pending(self.deps)["order"]["state"])
+
+    def test_settle_order_poll_202_counts_as_paid(self):
+        ph = "9" * 64
+        self.fake.http_responses = [(202, {}, fixture("api", "order_processing.json").encode())]
+        self.assertEqual(("ok", "processing"), mod.poll_order_status(self.deps, ph)[:2])
+
+        pending = mod.empty_pending()
+        pending["order"] = self.order_record(ph, "awaiting_payment")
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [
+            (202, {}, fixture("api", "order_processing.json").encode()),
+            (202, {}, fixture("api", "claim_processing.json").encode()),
+        ]
+        doc = self.run_verb("settle")
+        self.assertEqual((11, "claiming"), (doc["exit_code"], doc["state"]))
+        self.assertEqual(["/subscription/" + ph, "/subscription/claim"],
+                         [url[url.index("/subscription/"):] for url, _payload in self.fake.http_calls[-2:]])
 
     def test_settle_renewal_confirms_without_restarting_tunnel_or_lightning(self):
         self.store()
@@ -2992,11 +3084,7 @@ class TestNotificationsAndTickHooks(ModuleTestCase):
             "node_payment": {"state": "none", "result": None},
         }
         mod.save_pending(self.deps, pending)
-        claim_doc = {
-            "peer": {"publicKey": ALICE_PUB, "ip": "10.9.0.42/32", "presharedKey": BOB_PUB, "vpnPort": 24556},
-            "server": {"publicKey": BOB_PUB, "endpoint": "de2.tunnelsats.com:51820", "allowedIPs": "0.0.0.0/0", "persistentKeepalive": 25},
-            "subscriptionEnd": "2026-12-01T00:00:00Z",
-        }
+        claim_doc = fixture_json("api", "claim_client_held.json")
         self.fake.http_responses = [
             (200, {}, json.dumps({"status": "paid"}).encode()),
             (200, {}, json.dumps(claim_doc).encode()),
@@ -3144,11 +3232,9 @@ class TestPayNode(ModuleTestCase):
     HASH_2 = hashlib.sha256(bytes.fromhex(PREIMAGE_2)).hexdigest()
 
     def valid_claim_doc(self, pub=ALICE_PUB):
-        return {
-            "peer": {"publicKey": pub, "ip": "10.9.0.42/32", "presharedKey": BOB_PUB, "vpnPort": 24556},
-            "server": {"publicKey": BOB_PUB, "endpoint": "de2.tunnelsats.com:51820", "allowedIPs": "0.0.0.0/0", "persistentKeepalive": 25},
-            "subscriptionEnd": "2026-12-01T00:00:00Z",
-        }
+        doc = fixture_json("api", "claim_client_held.json")
+        doc["peer"]["publicKey"] = pub
+        return doc
 
     def test_lnd_pay_node_preflight_errors_and_success(self):
         self.record()

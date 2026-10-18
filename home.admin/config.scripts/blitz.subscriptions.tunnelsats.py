@@ -1668,7 +1668,8 @@ def _api_json_request(deps, url, payload=None):
 
 def poll_order_status(deps, payment_hash):
     """Polls GET /api/public/v1/subscription/{paymentHash}. Returns (outcome, status_str, doc, detail)
-    where outcome is 'ok', 'not_found', 'failed', or 'invalid'."""
+    where outcome is 'ok', 'not_found', 'failed', or 'invalid'. HTTP 202 (status 'processing') means
+    the payment is confirmed and the API is still provisioning or renewing: status_str 'processing'."""
     if not isinstance(payment_hash, str) or not HEX64_RE.fullmatch(payment_hash.lower()):
         return "invalid", None, None, "invalid paymentHash"
     try:
@@ -1677,8 +1678,10 @@ def poll_order_status(deps, payment_hash):
         if exc.exit_code == EXIT_API_UNAVAILABLE:
             return "failed", None, None, exc.message
         return "invalid", None, None, exc.message
-    if status == 200 and isinstance(doc, dict):
+    if status in (200, 202) and isinstance(doc, dict):
         raw_st = str(doc.get("status") or "").strip().lower()
+        if status == 202 or raw_st == "processing":
+            return "ok", "processing", doc, ""
         if raw_st in ("pending", "awaiting_payment", "unpaid"):
             return "ok", "pending", doc, ""
         if raw_st in ("paid", "claimed", "expired"):
@@ -1730,7 +1733,9 @@ def poll_reset_status(deps, payment_hash):
 def assemble_claimed_config(claim_doc, private_key, expected_public_key):
     """Concept 4.4 Claim Trust Boundary: validates individual fields of a /subscription/claim response,
     never reads fullConfig/config/peer.privateKey, verifies peer.publicKey matches the locally derived
-    public key, and builds and re-parses the canonical WireGuard config. Raises ModuleError(E_CLAIM_INVALID)."""
+    public key, and builds and re-parses the canonical WireGuard config. Raises ModuleError(E_CLAIM_INVALID).
+    The body of a client-held key order (API docs, ClaimResult): server {endpoint, publicKey, allowedIPs},
+    peer {address, publicKey, presharedKey}, vpnPort, subscriptionEnd."""
     def bad(msg):
         return ModuleError("E_CLAIM_INVALID", "invalid_response", msg, EXIT_INVALID_API)
 
@@ -1747,16 +1752,16 @@ def assemble_claimed_config(claim_doc, private_key, expected_public_key):
         raise bad("claim response is missing peer or server object")
     if peer.get("publicKey") != derived_pub:
         raise bad("claim peer.publicKey does not match local public key")
-    peer_ip_raw = peer.get("ip")
+    peer_ip_raw = peer.get("address")
     if not isinstance(peer_ip_raw, str) or not peer_ip_raw.strip():
-        raise bad("claim peer.ip is missing")
+        raise bad("claim peer.address is missing")
     peer_ip_str = peer_ip_raw.strip() if "/" in peer_ip_raw.strip() else peer_ip_raw.strip() + "/32"
     try:
         iface = ipaddress.IPv4Interface(peer_ip_str)
     except ValueError:
-        raise bad("claim peer.ip is not a valid IPv4 address") from None
+        raise bad("claim peer.address is not a valid IPv4 address") from None
     if iface.network.prefixlen != 32 or iface.ip not in ipaddress.IPv4Network("10.0.0.0/8"):
-        raise bad("claim peer.ip must be a /32 address inside 10.0.0.0/8")
+        raise bad("claim peer.address must be a /32 address inside 10.0.0.0/8")
     psk = peer.get("presharedKey")
     if psk is not None and psk != "":
         if not isinstance(psk, str) or not KEY_RE.fullmatch(psk.strip()):
@@ -1764,7 +1769,7 @@ def assemble_claimed_config(claim_doc, private_key, expected_public_key):
         psk = psk.strip()
     else:
         psk = None
-    vpn_port = peer.get("vpnPort") if peer.get("vpnPort") is not None else claim_doc.get("vpnPort")
+    vpn_port = claim_doc.get("vpnPort")
     if not valid_port(vpn_port):
         raise bad("claim vpnPort is missing or outside 1..65535")
     server_pub = server.get("publicKey")
@@ -1791,7 +1796,8 @@ def assemble_claimed_config(claim_doc, private_key, expected_public_key):
     allowed_ips = []
     for entry in allowed_parts:
         try:
-            allowed_ips.append(str(ipaddress.IPv4Network(entry, strict=False)))
+            # the rule of IMPORT (parse_wg_config): IPv4 and IPv6 networks, 0.0.0.0/0 required below
+            allowed_ips.append(str(ipaddress.ip_network(entry, strict=False)))
         except ValueError:
             raise bad("claim server.allowedIPs holds an invalid network") from None
     if "0.0.0.0/0" not in allowed_ips:
@@ -1913,7 +1919,7 @@ def cmd_buy(deps, args, result):
             else:
                 if HEX64_RE.fullmatch(str(cur.get("payment_hash") or "")):
                     p_out, p_status, _p_doc, _p_det = poll_order_status(deps, cur["payment_hash"])
-                    if p_out == "ok" and p_status in ("paid", "claimed"):
+                    if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                         cur["state"] = "paid"
                         save_pending(deps, pending)
                         raise ModuleError("E_ORDER_PENDING", "refused",
@@ -2054,7 +2060,7 @@ def cmd_renew(deps, args, result):
                 reused = True
             elif HEX64_RE.fullmatch(str(cur.get("payment_hash") or "")):
                 p_out, p_status, _p_doc, _p_det = poll_order_status(deps, cur["payment_hash"])
-                if p_out == "ok" and p_status in ("paid", "claimed"):
+                if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                     cur["state"] = "paid"
                     save_pending(deps, pending)
                     raise ModuleError("E_RENEWAL_PENDING", "refused",
@@ -2360,6 +2366,11 @@ def _claim_and_store_order(deps, pending, order, result, foreground=True, notify
         order["error_detail"] = "claim conflict (HTTP 409): public key or order was already claimed"
         save_pending(deps, pending)
         raise ModuleError("E_CLAIM_CONFLICT", "invalid_response", order["error_detail"], EXIT_INVALID_API)
+    if status in (202, 402) or (isinstance(doc, dict) and str(doc.get("status") or "").strip().lower() == "processing"):
+        # 202: paid, the API still provisions the tunnel; 402: the API does not see the payment yet.
+        # Both ask the client to retry the claim, so the order stays in claiming for the next pass.
+        return {"done": False, "kind": "order", "state": "claiming",
+                "payment_hash": order["payment_hash"], "retryable": True}
     if status >= 500 or status == 429:
         if foreground:
             raise ModuleError("E_API_UNAVAILABLE", "retryable",
@@ -2457,7 +2468,7 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
                     "payment_hash": order.get("payment_hash")}, None
         if order.get("state") in ("awaiting_payment", "expired_unpaid"):
             p_out, p_status, _p_doc, _p_det = poll_order_status(deps, order.get("payment_hash"))
-            if p_out == "ok" and p_status in ("paid", "claimed"):
+            if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                 order["state"] = "paid"
                 save_pending(deps, pending)
                 if notify_event and not order.get("payment_notified"):
@@ -2492,7 +2503,7 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
                 continue
             if ret_order.get("state") in ("awaiting_payment", "superseded", "expired_unpaid"):
                 p_out, p_status, _p_doc, _p_det = poll_order_status(deps, ret_order.get("payment_hash"))
-                if p_out == "ok" and p_status in ("paid", "claimed"):
+                if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                     ret_order["state"] = "paid"
                     save_pending(deps, pending)
             if ret_order.get("state") in ("paid", "claiming"):
@@ -2518,7 +2529,7 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
     if outcome_dict is None and isinstance(renewal, dict):
         if renewal.get("state") in ("awaiting_payment", "expired_unpaid"):
             p_out, p_status, _p_doc, _p_det = poll_order_status(deps, renewal.get("payment_hash"))
-            if p_out == "ok" and p_status in ("paid", "claimed"):
+            if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                 renewal["state"] = "paid"
                 save_pending(deps, pending)
                 if notify_event and not renewal.get("payment_notified"):
