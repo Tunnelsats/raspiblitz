@@ -4620,8 +4620,9 @@ def cmd_tick(deps, args, result):
 # menu (TUI)
 # ------------------------------------------------------------------------------------------
 
-ABOUT_TEXT = """TunnelSats routes this node's Lightning clearnet traffic through a WireGuard
-VPN. Peers see the VPN server's address, never your home IP.
+ABOUT_TEXT = """TunnelSats (https://tunnelsats.com) routes this node's Lightning clearnet
+traffic through a WireGuard VPN. Peers see the VPN server's address, never
+your home IP.
 
 - Your node becomes reachable on clearnet via the VPN server and connects to
   clearnet peers through the tunnel. Tor stays on for onion peers.
@@ -4630,7 +4631,14 @@ VPN. Peers see the VPN server's address, never your home IP.
 - TunnelSats sees your home IP (as the VPN client) and your WireGuard public
   key. Your private key never leaves this node.
 
-Buy a subscription in the menu (BUY) or on tunnelsats.com (IMPORT)."""
+Official links & resources (https://tunnelsats.com):
+- Guide:   https://tunnelsats.com/guide   (Setup & hybrid mode guides)
+- Status:  https://tunnelsats.com/status  (Live server health & latency)
+- FAQ:     https://tunnelsats.com/faq     (Pricing, bandwidth & Q&A)
+- Support: https://tunnelsats.com/support (Nostr, Telegram & help)
+- API:     https://api.tunnelsats.com     (Public API & L402/x402 docs)
+
+Buy a subscription in the menu (BUY) or at https://tunnelsats.com (IMPORT)."""
 
 VERDICT_TEXT = {"protected": "Protected", "degraded": "Clearnet paused, Tor peers keep working",
                 "unsafe": "Action needed", "not_configured": "Not set up"}
@@ -4671,7 +4679,7 @@ def menu_choices(deps, state, conf, found=None):
             choices.insert(1, ("RESUME", "Resume pending subscription order"))
         if (found or {}).get("adopt_available"):
             choices.append(("ADOPT", "Take over the existing TunnelSats setup"))
-        choices.append(("ABOUT", "How it works, privacy trade-offs"))
+        choices.append(("ABOUT", "How it works, privacy trade-offs & links"))
         return choices, None
     active_ts = conf.get("tunnelsats") == "on"
     impl = state.get("impl") or conf.get("tunnelsatsImpl") or "lnd"
@@ -4703,6 +4711,7 @@ def menu_choices(deps, state, conf, found=None):
             record = read_guard_record(deps, BASES[impl])
             if record and record.get("reason") in RESTARTABLE:
                 choices.append(("RESTART", "Restart Lightning to resume clearnet"))
+    choices.append(("ABOUT", "How it works, privacy trade-offs & links"))
     return choices, notice
 
 
@@ -4851,7 +4860,7 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
         if code != d.OK:
             return
         if tag == "ABOUT":
-            d.msgbox(ABOUT_TEXT, title="About TunnelSats", width=80, height=22)
+            d.msgbox(ABOUT_TEXT, title="About TunnelSats", width=80, height=26)
         elif tag == "BUY":
             srv_doc = menu_run(deps, ["servers"])
             srv_list = srv_doc.get("servers") or []
@@ -4928,7 +4937,7 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
                                     width=70, height=10, title="IMPORT")
             if code != d.OK or not path.strip():
                 continue
-            if d.yesno(ABOUT_TEXT + "\n\nImport and activate now?", width=80, height=24, title="IMPORT") != d.OK:
+            if d.yesno(ABOUT_TEXT + "\n\nImport and activate now?", width=80, height=28, title="IMPORT") != d.OK:
                 continue
             os.system("clear")
             print("# TunnelSats: importing, this can take a few minutes ...")

@@ -66,15 +66,17 @@ def tunnelsats_detail_text():
         return "\nThe TunnelSats status could not be read.\n"
     guard = doc.get("guard") or {}
     return '''
-This is a TunnelSats VPN subscription for Lightning clearnet traffic.
+This is a TunnelSats VPN subscription (https://tunnelsats.com) for
+Lightning clearnet traffic.
 
 Server:        {server} (VPN port {port})
 Expires:       {expiry}
 TunnelSats:    {flag}
 Start guard:   {decision} ({reason})
 Last check:    {check}
+Resources:     https://tunnelsats.com/guide | /status | /faq | /support
 
-Use MANAGE for STATUS, CHECK, REPAIR and REMOVE.
+Use MANAGE for STATUS, CHECK, REPAIR, REMOVE and ABOUT.
 '''.format(server=doc.get("server_domain"), port=doc.get("vpn_port"), expiry=doc.get("expiry") or "unknown",
            flag=doc.get("tunnelsats"), decision=guard.get("decision"), reason=guard.get("reason"),
            check=(doc.get("last_check") or {}).get("verdict") or "none")
