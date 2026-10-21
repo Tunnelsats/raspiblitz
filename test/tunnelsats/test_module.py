@@ -1639,7 +1639,7 @@ class TestRemove(ModuleTestCase):
         self.assertEqual("off", conf.get("tunnelsats"))
         self.fake.its["audit lnd"] = (1, self.audit("unrepairable", "tor_inactive", [self.LINE], ["externalhosts"]))
         choices, notice = mod.menu_choices(self.deps, state, conf)
-        self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE"], [tag for tag, _text in choices])
+        self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE", "ABOUT"], [tag for tag, _text in choices])
         self.assertIn("again", dict(choices)["REMOVE"])
         self.assertIn("lnd.service stopped and disabled", notice)
         self.assertIn(self.LINE, notice)
@@ -1844,14 +1844,14 @@ class TestMenu(ModuleTestCase):
 
     def test_start_and_restart_only_while_tunnelsats_is_on(self):
         self.fake.units["lnd.service"]["ActiveState"] = "inactive"
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "START"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "START", "ABOUT"], self.tags())
         self.fake.units["lnd.service"]["ActiveState"] = "active"
         self.record(decision="tor-only", reason="emergency_block")
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "RESTART"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "RESTART", "ABOUT"], self.tags())
         self.fake.conf_set("tunnelsats", "off")
         for active in ("inactive", "failed", "active"):
             self.fake.units["lnd.service"]["ActiveState"] = active
-            self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE"], self.tags())
+            self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "ABOUT"], self.tags())
 
     def test_menu_start_only_while_tunnelsats_is_on(self):
         self.fake.conf_set("tunnelsats", "off")
@@ -1876,7 +1876,7 @@ class TestMenu(ModuleTestCase):
     def test_adopted_legacy_offers_upgrade(self):
         shutil.rmtree(self.path(mod.STATE_DIR))
         self.store(mode="adopted_legacy")
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "UPGRADE", "REPAIR", "REMOVE", "ABOUT"], self.tags())
         state = mod.load_state(self.deps)
         state["activation_pending"] = True
         mod.save_state(self.deps, state)
@@ -1884,9 +1884,20 @@ class TestMenu(ModuleTestCase):
         pending["renewal"] = {"renewal_id": "ren-1", "payment_hash": "b" * 64, "state": "awaiting_payment"}
         mod.save_pending(self.deps, pending)
         self.assertEqual(
-            ["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "RESUME", "ACTIVATE", "UPGRADE", "REPAIR", "REMOVE"],
+            ["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "RESUME", "ACTIVATE", "UPGRADE", "REPAIR", "REMOVE", "ABOUT"],
             self.tags(),
         )
+
+    def test_about_text_contains_brand_and_official_deeplinks(self):
+        for expected in (
+            "TunnelSats (https://tunnelsats.com)",
+            "https://tunnelsats.com/guide",
+            "https://tunnelsats.com/status",
+            "https://tunnelsats.com/faq",
+            "https://tunnelsats.com/support",
+            "https://api.tunnelsats.com",
+        ):
+            self.assertIn(expected, mod.ABOUT_TEXT)
 
 
 class TestAdopt(ModuleTestCase):
