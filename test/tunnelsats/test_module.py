@@ -131,6 +131,12 @@ class FakeSystem:
         }
         # LND resolves externalhosts and announces the resolved address (1.2.3.4 = endpoint.ipv4)
         self.getinfo = {"uris": ["0280a@1.2.3.4:24556", "0280a@exampleonion.onion:9735"]}
+        self.lnd_listpayments = (0, {"payments": []})
+        self.lnd_decodepayreq = None
+        self.lnd_payinvoice = (1, {}, "unable to find a path to destination")
+        self.cln_listpays = (0, {"pays": []})
+        self.cln_decode = None
+        self.cln_pay = (1, {"code": 205, "message": "Could not find a route"}, "")
         self.wg = {"latest-handshakes": "%s\t%d\n" % (BOB_PUB, int(NOW.timestamp()) - 30),
                    "transfer": "%s\t1000\t2000\n" % BOB_PUB}
 
@@ -140,6 +146,17 @@ class FakeSystem:
         if tokens and tokens[0] in ("install", "adopt", "guard"):
             return tokens[0]
         return " ".join(tokens)
+
+    def _pop_scripted(self, attr_name):
+        val = getattr(self, attr_name)
+        if isinstance(val, list):
+            val = val.pop(0) if len(val) > 1 else val[0]
+        if callable(val):
+            val = val()
+        rc, doc = val[0], val[1]
+        err = val[2] if len(val) > 2 else ""
+        out = doc if isinstance(doc, str) else json.dumps(doc)
+        return rc, out, err
 
     def run(self, argv, timeout=60, interactive=False):
         self.calls.append(list(argv))
@@ -220,6 +237,24 @@ class FakeSystem:
                     gone = argv[argv.index("--address_remove") + 1]
                     self.getinfo["uris"] = [u for u in self.getinfo["uris"] if not u.endswith("@" + gone)]
                 return self.announce_rc, "{}" if self.announce_rc == 0 else "", "" if self.announce_rc == 0 else "rpc error"
+            if "listpayments" in argv:
+                return self._pop_scripted("lnd_listpayments")
+            if "decodepayreq" in argv:
+                if self.lnd_decodepayreq is not None:
+                    return self._pop_scripted("lnd_decodepayreq")
+                inv_dec = mod.decode_bolt11(argv[-1])
+                return 0, json.dumps({"payment_hash": inv_dec["payment_hash"], "num_satoshis": str(inv_dec["amount_sats"])}), ""
+            if "payinvoice" in argv:
+                return self._pop_scripted("lnd_payinvoice")
+            if "listpays" in argv:
+                return self._pop_scripted("cln_listpays")
+            if "decode" in argv:
+                if self.cln_decode is not None:
+                    return self._pop_scripted("cln_decode")
+                inv_dec = mod.decode_bolt11(argv[-1])
+                return 0, json.dumps({"payment_hash": inv_dec["payment_hash"], "amount_msat": "%dmsat" % (inv_dec["amount_sats"] * 1000)}), ""
+            if "pay" in argv and "-k" in argv:
+                return self._pop_scripted("cln_pay")
             return (0, json.dumps(self.getinfo), "") if self.getinfo is not None else (1, "", "locked")
         if prog == mod.NOTIFY:
             return self.notify_rc, "", ""
@@ -1809,14 +1844,14 @@ class TestMenu(ModuleTestCase):
 
     def test_start_and_restart_only_while_tunnelsats_is_on(self):
         self.fake.units["lnd.service"]["ActiveState"] = "inactive"
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE", "START"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "START"], self.tags())
         self.fake.units["lnd.service"]["ActiveState"] = "active"
         self.record(decision="tor-only", reason="emergency_block")
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE", "RESTART"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE", "RESTART"], self.tags())
         self.fake.conf_set("tunnelsats", "off")
         for active in ("inactive", "failed", "active"):
             self.fake.units["lnd.service"]["ActiveState"] = active
-            self.assertEqual(["STATUS", "CHECK", "RENEW", "REPAIR", "REMOVE"], self.tags())
+            self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "REPAIR", "REMOVE"], self.tags())
 
     def test_menu_start_only_while_tunnelsats_is_on(self):
         self.fake.conf_set("tunnelsats", "off")
@@ -1841,15 +1876,17 @@ class TestMenu(ModuleTestCase):
     def test_adopted_legacy_offers_upgrade(self):
         shutil.rmtree(self.path(mod.STATE_DIR))
         self.store(mode="adopted_legacy")
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
+        self.assertEqual(["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
         state = mod.load_state(self.deps)
         state["activation_pending"] = True
         mod.save_state(self.deps, state)
         pending = mod.empty_pending()
         pending["renewal"] = {"renewal_id": "ren-1", "payment_hash": "b" * 64, "state": "awaiting_payment"}
         mod.save_pending(self.deps, pending)
-        self.assertEqual(["STATUS", "CHECK", "RENEW", "RESUME", "ACTIVATE", "UPGRADE", "REPAIR", "REMOVE"],
-                         self.tags())
+        self.assertEqual(
+            ["STATUS", "CHECK", "RENEW", "TOPUP", "BACKUP", "RESUME", "ACTIVATE", "UPGRADE", "REPAIR", "REMOVE"],
+            self.tags(),
+        )
 
 
 class TestAdopt(ModuleTestCase):
@@ -2624,9 +2661,9 @@ class TestBuyAndRenew(ModuleTestCase):
         self.assertEqual("paid", mod.load_pending(self.deps)["order"]["state"])
 
     def test_buy_refusals(self):
-        # --pay node is unsupported in P3
+        # --pay node without --yes requires confirmation
         doc = self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "node")
-        self.assertEqual((14, "E_PAY_UNSUPPORTED"), (doc["exit_code"], doc["error"]))
+        self.assertEqual((2, "E_CONFIRMATION_REQUIRED"), (doc["exit_code"], doc["error"]))
         # Invalid server ID
         doc = self.run_verb("buy", "--server", "BAD_SERVER!", "--months", "1", "--pay", "none")
         self.assertEqual((2, "E_USAGE"), (doc["exit_code"], doc["error"]))
@@ -2666,6 +2703,33 @@ class TestBuyAndRenew(ModuleTestCase):
         doc2 = self.run_verb("renew", "--months", "1", "--pay", "none")
         self.assertEqual((0, True, []), (doc2["exit_code"], doc2["reused"], self.fake.http_calls))
 
+    def test_buy_refuses_to_supersede_a_processing_order(self):
+        # HTTP 202 on the order poll: paid, the API still provisions it; never replaced by a new order
+        ph = "1" * 64
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "orderId": "ord-101", "paymentHash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph, expiry=3600),
+            "amountSats": 25000}).encode())]
+        self.assertEqual(0, self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")["exit_code"])
+        self.fake.http_responses = [(202, {}, fixture("api", "order_processing.json").encode())]
+        doc = self.run_verb("buy", "--server", "eu-de", "--months", "3", "--pay", "none")
+        self.assertEqual((14, "E_ORDER_PENDING"), (doc["exit_code"], doc["error"]))
+        pending = mod.load_pending(self.deps)
+        self.assertEqual(("paid", ph, []), (pending["order"]["state"], pending["order"]["payment_hash"],
+                                            pending["retained_orders"]))
+
+    def test_renew_refuses_to_replace_a_processing_renewal(self):
+        self.store()
+        ph = "4" * 64
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "renewalId": "ren-1", "paymentHash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph, expiry=3600),
+        }).encode())]
+        self.assertEqual(0, self.run_verb("renew", "--months", "1", "--pay", "none")["exit_code"])
+        self.fake.http_responses = [(202, {}, fixture("api", "order_processing.json").encode())]
+        doc = self.run_verb("renew", "--months", "3", "--pay", "none")
+        self.assertEqual((14, "E_RENEWAL_PENDING"), (doc["exit_code"], doc["error"]))
+        self.assertEqual(("paid", ph), (mod.load_pending(self.deps)["renewal"]["state"],
+                                        mod.load_pending(self.deps)["renewal"]["payment_hash"]))
+
 
 class TestInvoiceAndPending(ModuleTestCase):
     def test_invoice_qr_png_expiry_and_pending_redaction(self):
@@ -2699,36 +2763,38 @@ class TestInvoiceAndPending(ModuleTestCase):
 
 class TestClaimAndSettle(ModuleTestCase):
     def valid_claim_doc(self, pub=ALICE_PUB):
-        return {
-            "peer": {
-                "publicKey": pub,
-                "ip": "10.9.0.42/32",
-                "presharedKey": BOB_PUB,
-                "vpnPort": 24556,
-            },
-            "server": {
-                "publicKey": BOB_PUB,
-                "endpoint": "de2.tunnelsats.com:51820",
-                "allowedIPs": "0.0.0.0/0",
-                "persistentKeepalive": 25,
-            },
-            "subscriptionEnd": "2026-12-01T00:00:00Z",
-            "fullConfig": "[Interface]\nPrivateKey = EVIL_SERVER_KEY\n",
-        }
+        """The 200 claim body of the API (fixtures/api/claim_client_held.json), plus a hostile fullConfig
+        that the trust boundary must never read."""
+        doc = fixture_json("api", "claim_client_held.json")
+        doc["peer"]["publicKey"] = pub
+        doc["fullConfig"] = "[Interface]\nPrivateKey = EVIL_SERVER_KEY\n"
+        return doc
 
     def test_assemble_claimed_config_trust_boundary(self):
         cfg = mod.assemble_claimed_config(self.valid_claim_doc(), ALICE_PRIV, ALICE_PUB)
         self.assertEqual((ALICE_PRIV, ALICE_PUB, "de2.tunnelsats.com", 24556, "2026-12-01T00:00:00Z"),
                          (cfg["private_key"], cfg["public_key"], cfg["endpoint_host"], cfg["vpn_port"], cfg["valid_until"]))
+        # The API's allowedIPs (with ::/0) and its bare peer.address end up in the canonical config
+        self.assertEqual((["0.0.0.0/0", "::/0"], ["10.9.0.42/32"]), (cfg["allowed_ips"], cfg["addresses"]))
+        ipv4_only = dict(self.valid_claim_doc(), server=dict(self.valid_claim_doc()["server"], allowedIPs="0.0.0.0/0"))
+        self.assertEqual(["0.0.0.0/0"], mod.assemble_claimed_config(ipv4_only, ALICE_PRIV, ALICE_PUB)["allowed_ips"])
 
-        # Rejects mismatched peer.publicKey, bad IP, non-tunnelsats host, missing 0.0.0.0/0, bad port
+        # Rejects mismatched peer.publicKey, bad or missing address (including the undocumented name 'ip'),
+        # non-tunnelsats host, allowedIPs without 0.0.0.0/0 or with an invalid entry, bad port, bad date
+        peer, server = self.valid_claim_doc()["peer"], self.valid_claim_doc()["server"]
+        no_address = {k: v for k, v in peer.items() if k != "address"}
         bad_cases = [
-            {"peer": dict(self.valid_claim_doc()["peer"], publicKey=BOB_PUB)},
-            {"peer": dict(self.valid_claim_doc()["peer"], ip="192.168.1.1/32")},
-            {"peer": dict(self.valid_claim_doc()["peer"], ip="10.9.0.0/24")},
-            {"peer": dict(self.valid_claim_doc()["peer"], vpnPort=70000)},
-            {"server": dict(self.valid_claim_doc()["server"], endpoint="evil.example.com:51820")},
-            {"server": dict(self.valid_claim_doc()["server"], allowedIPs="10.0.0.0/8")},
+            {"peer": dict(peer, publicKey=BOB_PUB)},
+            {"peer": dict(peer, address="192.168.1.1")},
+            {"peer": dict(peer, address="10.9.0.0/24")},
+            {"peer": no_address},
+            {"peer": dict(no_address, ip="10.9.0.42/32")},
+            {"vpnPort": 70000},
+            {"vpnPort": None, "peer": dict(peer, vpnPort=24556)},
+            {"server": dict(server, endpoint="evil.example.com:51820")},
+            {"server": dict(server, allowedIPs="10.0.0.0/8")},
+            {"server": dict(server, allowedIPs="::/0")},
+            {"server": dict(server, allowedIPs="0.0.0.0/0, ::/0, not-a-network")},
             {"subscriptionEnd": "not-a-date"},
         ]
         for patch in bad_cases:
@@ -2790,6 +2856,69 @@ class TestClaimAndSettle(ModuleTestCase):
         self.assertEqual((12, "E_CLAIM_CONFLICT"), (doc["exit_code"], doc["error"]))
         saved = mod.load_pending(self.deps)["order"]
         self.assertEqual("needs_support", saved["state"])
+
+    def order_record(self, ph, state):
+        return {
+            "order_id": "ord-%s" % ph[:4], "payment_hash": ph, "invoice": make_bolt11("lnbc250u", payment_hash=ph),
+            "amount_sats": 25000, "server_id": "de2", "months": 1, "impl": "lnd",
+            "private_key": ALICE_PRIV, "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T13:00:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": state,
+            "node_payment": {"state": "none", "result": None},
+        }
+
+    def test_settle_claim_202_keeps_claiming_then_activates(self):
+        # Right after a node payment the claim can race the API's own provisioning (HTTP 202,
+        # "retry the claim"): the order stays in claiming and the next settle pass activates it
+        self.record()
+        ph = "8" * 64
+        pending = mod.empty_pending()
+        pending["order"] = self.order_record(ph, "paid")
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [(202, {}, fixture("api", "claim_processing.json").encode())]
+        doc = self.run_verb("settle")
+        self.assertEqual((11, "claiming", True), (doc["exit_code"], doc["state"], doc["retryable"]))
+        saved = mod.load_pending(self.deps)["order"]
+        self.assertEqual(("claiming", None, ALICE_PRIV), (saved["state"], saved.get("error_code"), saved["private_key"]))
+        self.assertIsNone(mod.load_state(self.deps))
+
+        self.fake.http_responses = [
+            (200, {}, json.dumps(self.valid_claim_doc()).encode()),
+            (200, {}, fixture("api", "status_enabled.json").encode()),
+        ]
+        doc2 = self.run_verb("settle")
+        self.assertEqual((0, "active", "protected"), (doc2["exit_code"], doc2["state"], doc2["verdict"]))
+        self.assertIsNone(mod.load_pending(self.deps)["order"])
+        self.assertEqual((["0.0.0.0/0", "::/0"], ["10.9.0.42/32"], 24556),
+                         (mod.load_stored_config(self.deps)["allowed_ips"], mod.load_stored_config(self.deps)["addresses"],
+                          mod.load_stored_config(self.deps)["vpn_port"]))
+
+    def test_settle_claim_402_keeps_claiming(self):
+        ph = "8" * 64
+        pending = mod.empty_pending()
+        pending["order"] = self.order_record(ph, "paid")
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [(402, {}, fixture("api", "error_payment_not_confirmed.json").encode())]
+        doc = self.run_verb("settle")
+        self.assertEqual((11, "claiming", True), (doc["exit_code"], doc["state"], doc["retryable"]))
+        self.assertEqual("claiming", mod.load_pending(self.deps)["order"]["state"])
+
+    def test_settle_order_poll_202_counts_as_paid(self):
+        ph = "9" * 64
+        self.fake.http_responses = [(202, {}, fixture("api", "order_processing.json").encode())]
+        self.assertEqual(("ok", "processing"), mod.poll_order_status(self.deps, ph)[:2])
+
+        pending = mod.empty_pending()
+        pending["order"] = self.order_record(ph, "awaiting_payment")
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [
+            (202, {}, fixture("api", "order_processing.json").encode()),
+            (202, {}, fixture("api", "claim_processing.json").encode()),
+        ]
+        doc = self.run_verb("settle")
+        self.assertEqual((11, "claiming"), (doc["exit_code"], doc["state"]))
+        self.assertEqual(["/subscription/" + ph, "/subscription/claim"],
+                         [url[url.index("/subscription/"):] for url, _payload in self.fake.http_calls[-2:]])
 
     def test_settle_renewal_confirms_without_restarting_tunnel_or_lightning(self):
         self.store()
@@ -2955,11 +3084,7 @@ class TestNotificationsAndTickHooks(ModuleTestCase):
             "node_payment": {"state": "none", "result": None},
         }
         mod.save_pending(self.deps, pending)
-        claim_doc = {
-            "peer": {"publicKey": ALICE_PUB, "ip": "10.9.0.42/32", "presharedKey": BOB_PUB, "vpnPort": 24556},
-            "server": {"publicKey": BOB_PUB, "endpoint": "de2.tunnelsats.com:51820", "allowedIPs": "0.0.0.0/0", "persistentKeepalive": 25},
-            "subscriptionEnd": "2026-12-01T00:00:00Z",
-        }
+        claim_doc = fixture_json("api", "claim_client_held.json")
         self.fake.http_responses = [
             (200, {}, json.dumps({"status": "paid"}).encode()),
             (200, {}, json.dumps(claim_doc).encode()),
@@ -2979,5 +3104,320 @@ class TestNotificationsAndTickHooks(ModuleTestCase):
         self.assertEqual(9.5, mod.load_state(self.deps)["api"]["data"]["bandwidth_used_gb"])
 
 
+# ------------------------------------------------------------------------------------------
+# topup (bandwidth reset) and reset settlement (P4 Commit 1)
+# ------------------------------------------------------------------------------------------
+
+class TestTopupAndResetSettle(ModuleTestCase):
+    def test_topup_creates_reuses_and_handles_reset_limit(self):
+        # Unconfigured node refuses topup
+        doc_unconf = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((3, "E_NOT_CONFIGURED"), (doc_unconf["exit_code"], doc_unconf["error"]))
+
+        self.store()
+        ph = "b" * 64
+        inv = make_bolt11("lnbc50u", payment_hash=ph, expiry=900)
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "resetId": "rst-1", "paymentHash": ph, "invoice": inv, "amountSats": 5000,
+            "expiresAt": "2026-10-14T12:15:00Z",
+        }).encode())]
+        doc1 = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((0, "awaiting_payment", False, "rst-1", ph, 5000, "de2"),
+                         (doc1["exit_code"], doc1["state"], doc1["reused"], doc1["reset_id"],
+                          doc1["payment_hash"], doc1["amount_sats"], doc1["server_id"]))
+        self.assertEqual({"wgPublicKey": ALICE_PUB, "serverId": "de2"}, self.fake.http_calls[-1][1])
+        self.assertIn([mod.ITS, "tick-timer", "on"], self.fake.calls)
+
+        # Second topup while invoice is unexpired polls reset status (pending) and reuses same invoice (TC-21)
+        self.fake.http_calls.clear()
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode())]
+        doc2 = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((0, True, ph), (doc2["exit_code"], doc2["reused"], doc2["payment_hash"]))
+        self.assertEqual([(mod.API_SUBSCRIPTION_URL + "/" + ph, None)], self.fake.http_calls)
+
+        # If poll during reuse shows paid/processing, refuses with E_ORDER_PENDING and marks reset paid
+        self.fake.http_responses = [(202, {}, json.dumps({"status": "processing", "type": "bandwidth_reset"}).encode())]
+        doc_paid = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((14, "E_ORDER_PENDING"), (doc_paid["exit_code"], doc_paid["error"]))
+        self.assertEqual("paid", mod.load_pending(self.deps)["reset"]["state"])
+
+        # Clear pending reset and test 429 monthly reset limit vs generic 429 rate limit
+        mod.save_pending(self.deps, mod.empty_pending())
+        self.fake.http_responses = [(429, {}, b'{"message": "Maximum 2 resets per month reached"}')]
+        doc_lim = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((14, "E_RESET_LIMIT"), (doc_lim["exit_code"], doc_lim["error"]))
+
+        self.fake.http_responses = [(429, {}, b'{"message": "Too many requests"}')]
+        doc_rl = self.run_verb("topup", "--pay", "none")
+        self.assertEqual((13, "E_RATE_LIMITED"), (doc_rl["exit_code"], doc_rl["error"]))
+
+    def test_settle_reset_confirms_and_clears_bandwidth_notifications(self):
+        self.store()
+        self.activate_conf()
+        state = mod.load_state(self.deps)
+        state["notify_state"] = {
+            "expiry_cycle": "2026-12-01T00:00:00.000Z",
+            "bandwidth_cycle": "2026-12-01T00:00:00.000Z:0",
+            "verdict_seq": 0,
+            "last_verdict": "protected",
+            "verdict_warning_handed_off": False,
+            "daily": {"date": "2026-10-14", "count": 0},
+            "events": {
+                "bandwidth_high": {"cycle": "2026-12-01T00:00:00.000Z:0", "attempts": 1, "outcome": "handed_off"},
+                "bandwidth_exhausted": {"cycle": "2026-12-01T00:00:00.000Z:0", "attempts": 1, "outcome": "handed_off"},
+            },
+        }
+        mod.save_state(self.deps, state)
+
+        ph = "c" * 64
+        pending = mod.empty_pending()
+        pending["reset"] = {
+            "reset_id": "rst-c", "payment_hash": ph, "invoice": make_bolt11("lnbc50u", payment_hash=ph),
+            "amount_sats": 5000, "server_id": "de2", "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T12:15:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": "awaiting_payment",
+            "old_resets": 0, "old_used_gb": 85.0,
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+
+        reset_status = dict(fixture_json("api", "status_enabled.json"),
+                            bandwidth_used_gb=0.0, bandwidth_resets_this_month=1)
+        # Pass 1: 202 processing -> waits 5s; Pass 2: 200 paid + api_status -> confirmed
+        self.fake.http_responses = [
+            (202, {}, json.dumps({"status": "processing", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps({"status": "paid", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps(reset_status).encode()),
+        ]
+        self.fake.calls.clear()
+        doc = self.run_verb("settle", "--wait", "10")
+        self.assertEqual((0, "reset", "confirmed", 0.0, 1, [5]),
+                         (doc["exit_code"], doc["kind"], doc["state"], doc["bandwidth_used_gb"],
+                          doc["resets_this_month"], self.fake.sleeps))
+        self.assertIsNone(mod.load_pending(self.deps)["reset"])
+        new_state = mod.load_state(self.deps)
+        self.assertEqual(1, new_state["api"]["data"]["resets_this_month"])
+        self.assertEqual({}, new_state["notify_state"]["events"])
+        self.assertEqual([], [c for c in self.fake.calls if c[0] in ("systemctl", mod.ITS)])
+
+    def test_settle_reset_server_failure_marks_needs_support(self):
+        self.store()
+        ph = "d" * 64
+        pending = mod.empty_pending()
+        pending["reset"] = {
+            "reset_id": "rst-d", "payment_hash": ph, "invoice": make_bolt11("lnbc50u", payment_hash=ph),
+            "amount_sats": 5000, "server_id": "de2", "public_key": ALICE_PUB,
+            "created_at": "2026-10-14T12:00:00Z", "invoice_expires_at": "2026-10-14T12:15:00Z",
+            "retained_until": "2026-10-15T12:00:00Z", "state": "paid",
+            "old_resets": 0, "old_used_gb": 90.0,
+            "node_payment": {"state": "none", "result": None},
+        }
+        mod.save_pending(self.deps, pending)
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "failed", "type": "bandwidth_reset"}).encode()),
+        ]
+        doc = self.run_verb("settle")
+        self.assertEqual((12, "E_RESET_FAILED"), (doc["exit_code"], doc["error"]))
+        self.assertEqual("needs_support", mod.load_pending(self.deps)["reset"]["state"])
+
+
+# ------------------------------------------------------------------------------------------
+# pay-node (LND and CLN node payment with preflight and 1% fee cap, P4 Commit 2)
+# ------------------------------------------------------------------------------------------
+
+class TestPayNode(ModuleTestCase):
+    PREIMAGE_1 = "11" * 32
+    HASH_1 = hashlib.sha256(bytes.fromhex(PREIMAGE_1)).hexdigest()
+    PREIMAGE_2 = "22" * 32
+    HASH_2 = hashlib.sha256(bytes.fromhex(PREIMAGE_2)).hexdigest()
+
+    def valid_claim_doc(self, pub=ALICE_PUB):
+        doc = fixture_json("api", "claim_client_held.json")
+        doc["peer"]["publicKey"] = pub
+        return doc
+
+    def test_lnd_pay_node_preflight_errors_and_success(self):
+        self.record()
+        # pay-node without --yes requires confirmation
+        self.assertEqual((2, "E_CONFIRMATION_REQUIRED"),
+                         (self.run_verb("pay-node")["exit_code"], self.run_verb("pay-node")["error"]))
+        # pay-node with no pending item returns E_NO_PENDING
+        self.assertEqual((3, "E_NO_PENDING"),
+                         (self.run_verb("pay-node", "--yes")["exit_code"], self.run_verb("pay-node", "--yes")["error"]))
+
+        inv = make_bolt11("lnbc250u", payment_hash=self.HASH_1, expiry=3600)
+        self.fake.http_responses = [(200, {}, json.dumps({
+            "orderId": "ord-pay1", "paymentHash": self.HASH_1, "invoice": inv, "amountSats": 25000,
+        }).encode())]
+        self.run_verb("buy", "--server", "eu-de", "--months", "1", "--pay", "none")
+
+        # 1. Wallet locked (listpayments rc != 0) -> E_PAY_NODE_LOCKED (exit 10), order stays awaiting_payment
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+        self.fake.lnd_listpayments = (1, "", "wallet locked")
+        doc_lock = self.run_verb("pay-node", "--yes")
+        self.assertEqual((10, "E_PAY_NODE_LOCKED"), (doc_lock["exit_code"], doc_lock["error"]))
+        self.assertEqual("awaiting_payment", mod.load_pending(self.deps)["order"]["state"])
+
+        # 2. decodepayreq amount mismatch -> E_INVOICE_MISMATCH (exit 12), payinvoice never called
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+        self.fake.lnd_listpayments = (0, {"payments": []})
+        self.fake.lnd_decodepayreq = (0, {"payment_hash": self.HASH_1, "num_satoshis": "99000"})
+        doc_mis = self.run_verb("pay-node", "--yes")
+        self.assertEqual((12, "E_INVOICE_MISMATCH"), (doc_mis["exit_code"], doc_mis["error"]))
+        self.assertEqual([], [c for c in self.fake.calls if "payinvoice" in c])
+        self.fake.lnd_decodepayreq = None
+
+        # 3. Unfunded / no route / insufficient balance mappings (exit 10), invoice stays retryable
+        for reason_str, expected_code in (
+            ("FAILURE_REASON_NO_ROUTE", "E_PAY_NO_ROUTE"),
+            ("FAILURE_REASON_INSUFFICIENT_BALANCE", "E_PAY_INSUFFICIENT_BALANCE"),
+        ):
+            self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+            self.fake.lnd_listpayments = (0, {"payments": []})
+            self.fake.lnd_payinvoice = (1, {"status": "FAILED", "failure_reason": reason_str}, "")
+            doc_err = self.run_verb("pay-node", "--yes")
+            self.assertEqual((10, expected_code, 250),
+                             (doc_err["exit_code"], doc_err["error"], doc_err["fee_limit_sats"]))
+            self.assertEqual("awaiting_payment", mod.load_pending(self.deps)["order"]["state"])
+            self.assertEqual("failed", mod.load_pending(self.deps)["order"]["node_payment"]["state"])
+
+        # 4. Already paid in LND listpayments -> E_ALREADY_PAID (exit 14), marks order paid without calling payinvoice
+        self.fake.calls.clear()
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending"}).encode())]
+        self.fake.lnd_listpayments = (0, {"payments": [{"payment_hash": self.HASH_1, "status": "SUCCEEDED"}]})
+        doc_dup = self.run_verb("pay-node", "--yes")
+        self.assertEqual((14, "E_ALREADY_PAID"), (doc_dup["exit_code"], doc_dup["error"]))
+        self.assertEqual([], [c for c in self.fake.calls if "payinvoice" in c])
+        self.assertEqual("paid", mod.load_pending(self.deps)["order"]["state"])
+
+        # Reset order to awaiting_payment and test full LND payinvoice -> preimage verification -> claim -> active
+        pending = mod.load_pending(self.deps)
+        order_pub = pending["order"]["public_key"]
+        pending["order"]["state"] = "awaiting_payment"
+        pending["order"]["node_payment"] = {"state": "none", "result": None}
+        mod.save_pending(self.deps, pending)
+        self.fake.lnd_listpayments = (0, {"payments": []})
+        self.fake.lnd_payinvoice = (0, {
+            "status": "SUCCEEDED",
+            "payment_preimage": self.PREIMAGE_1,
+            "payment_hash": self.HASH_1,
+            "fee_sat": "12",
+        }, "")
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "pending"}).encode()),
+            (200, {}, json.dumps(self.valid_claim_doc(pub=order_pub)).encode()),
+            (200, {}, fixture("api", "status_enabled.json").encode()),
+        ]
+        doc_ok = self.run_verb("pay-node", "--yes")
+        self.assertEqual((0, "order", "active", "protected", 250),
+                         (doc_ok["exit_code"], doc_ok["kind"], doc_ok["state"], doc_ok["verdict"], doc_ok["fee_limit_sats"]))
+        self.assertEqual(("succeeded", 12, True),
+                         (doc_ok["node_payment"]["state"], doc_ok["node_payment"]["fee_sats"],
+                          doc_ok["node_payment"]["preimage_verified"]))
+        self.assertIn(
+            mod.LNCLI + ["payinvoice", "--force", "--json", "--timeout", "60s", "--fee_limit", "250", "--pay_req", inv],
+            self.fake.calls,
+        )
+        self.assertIsNone(mod.load_pending(self.deps)["order"])
+
+    def test_cln_topup_pay_node_and_error_mappings(self):
+        self.store(impl="cl")
+        self.activate_conf(impl="cl")
+        inv = make_bolt11("lnbc50u", payment_hash=self.HASH_2, expiry=900)
+
+        # CLN code 205 (no route) during topup --pay node --yes -> creates reset invoice, fails payment with E_PAY_NO_ROUTE
+        self.fake.http_responses = [
+            (200, {}, json.dumps({
+                "resetId": "rst-cln", "paymentHash": self.HASH_2, "invoice": inv, "amountSats": 5000,
+            }).encode()),
+            (200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode()),
+        ]
+        self.fake.cln_listpays = (0, {"pays": []})
+        self.fake.cln_pay = (1, {"code": 205, "message": "Could not find a route"}, "")
+        doc_nr = self.run_verb("topup", "--pay", "node", "--yes")
+        self.assertEqual((10, "E_PAY_NO_ROUTE", 50),
+                         (doc_nr["exit_code"], doc_nr["error"], doc_nr["fee_limit_sats"]))
+        self.assertIn(
+            mod.CLNCLI + ["-k", "pay", "bolt11=" + inv, "maxfee=50000msat", "retry_for=60"],
+            self.fake.calls,
+        )
+
+        # CLN insufficient funds -> E_PAY_INSUFFICIENT_BALANCE
+        self.fake.http_responses = [(200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode())]
+        self.fake.cln_pay = (1, {"code": -32602, "message": "Could not afford 5000000msat: insufficient funds"}, "")
+        doc_ib = self.run_verb("pay-node", "--kind", "reset", "--impl", "cl", "--yes")
+        self.assertEqual((10, "E_PAY_INSUFFICIENT_BALANCE"), (doc_ib["exit_code"], doc_ib["error"]))
+
+        # CLN payment succeeds -> verifies preimage -> settles bandwidth reset
+        reset_status = dict(fixture_json("api", "status_enabled.json"),
+                            bandwidth_used_gb=0.0, bandwidth_resets_this_month=1)
+        self.fake.http_responses = [
+            (200, {}, json.dumps({"status": "pending", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps({"status": "paid", "type": "bandwidth_reset"}).encode()),
+            (200, {}, json.dumps(reset_status).encode()),
+        ]
+        self.fake.cln_pay = (0, {
+            "status": "complete",
+            "payment_preimage": self.PREIMAGE_2,
+            "payment_hash": self.HASH_2,
+            "amount_msat": "5000000msat",
+            "amount_sent_msat": "5004000msat",
+        }, "")
+        doc_ok = self.run_verb("pay-node", "--kind", "reset", "--impl", "cl", "--yes")
+        self.assertEqual((0, "reset", "confirmed", 50, 4),
+                         (doc_ok["exit_code"], doc_ok["kind"], doc_ok["state"],
+                          doc_ok["fee_limit_sats"], doc_ok["node_payment"]["fee_sats"]))
+        self.assertIsNone(mod.load_pending(self.deps)["reset"])
+
+
+# ------------------------------------------------------------------------------------------
+# export (BACKUP) and P4 menu flows (P4 Commit 3)
+# ------------------------------------------------------------------------------------------
+
+class TestExportAndMenuP4(ModuleTestCase):
+    def test_export_and_import_dry_run_round_trip_tc22(self):
+        os.makedirs(self.path("/home/admin"), exist_ok=True)
+        out_file = self.path("/home/admin/ts-backup.conf")
+        # Unconfigured node refuses export
+        doc_unconf = self.run_verb("export", "--out", out_file)
+        self.assertEqual((3, "E_NOT_CONFIGURED"), (doc_unconf["exit_code"], doc_unconf["error"]))
+
+        self.store()
+        # Missing parent directory is refused with E_USAGE
+        doc_noparent = self.run_verb("export", "--out", self.path("/nonexistent/dir/ts-backup.conf"))
+        self.assertEqual((2, "E_USAGE"), (doc_noparent["exit_code"], doc_noparent["error"]))
+
+        # Symlink target is refused with E_USAGE
+        sym_path = self.path("/home/admin/sym-backup.conf")
+        os.symlink(out_file, sym_path)
+        doc_sym = self.run_verb("export", "--out", sym_path)
+        self.assertEqual((2, "E_USAGE"), (doc_sym["exit_code"], doc_sym["error"]))
+
+        # Valid export writes 0600 canonical config and leaks no key material in JSON
+        doc_exp = self.run_verb("export", "--out", out_file)
+        self.assertEqual((0, True, out_file, "0600", "admin", ALICE_PUB, 24556),
+                         (doc_exp["exit_code"], doc_exp["exported"], doc_exp["file"],
+                          doc_exp["mode"], doc_exp["owner"], doc_exp["public_key"], doc_exp["vpn_port"]))
+        self.assertNotIn(ALICE_PRIV, json.dumps(doc_exp))
+        st = os.stat(out_file)
+        self.assertEqual(0o600, st.st_mode & 0o777)
+
+        # TC-22: import --file <exported> --dry-run round-trips cleanly
+        doc_imp = self.run_verb("import", "--file", out_file, "--dry-run")
+        self.assertEqual((0, True, True, ALICE_PUB),
+                         (doc_imp["exit_code"], doc_imp["valid"], doc_imp["dry_run"], doc_imp["public_key"]))
+
+        # Pending reset offers RESUME in menu_choices
+        pending = mod.empty_pending()
+        pending["reset"] = {"reset_id": "rst-m", "payment_hash": "e" * 64, "state": "awaiting_payment"}
+        mod.save_pending(self.deps, pending)
+        tags = [tag for tag, _ in mod.menu_choices(self.deps, mod.load_state(self.deps), mod.read_rb_conf(self.deps))[0]]
+        self.assertIn("RESUME", tags)
+        self.assertIn("TOPUP", tags)
+        self.assertIn("BACKUP", tags)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

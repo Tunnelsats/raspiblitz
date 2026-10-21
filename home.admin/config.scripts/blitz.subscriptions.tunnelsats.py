@@ -8,9 +8,13 @@ the subscription (a WireGuard config rebuilt from validated fields, plus state) 
 import, adoption, checks, repair and removal.
 
 Verbs (all with --json; every verb except --help needs root, the state is root 0600):
-  menu | import --file FILE [--impl lnd|cl] [--dry-run] [--yes] | adopt [--yes] [--upgrade]
-  status [--refresh|--cached] | check | detect | repair [--impl lnd|cl] --yes
-  uninstall --yes [--purge] | subscriptions-list | tick
+  menu | servers | buy --server ID --months N --pay node|qr|copy|none [--yes] [--impl lnd|cl]
+  renew --months N --pay node|qr|copy|none [--yes] | topup --pay node|qr|copy|none [--yes]
+  invoice [--kind order|renewal|reset] [--qr-png PATH] | pending | settle [--wait S]
+  pay-node [--kind order|renewal|reset] [--impl lnd|cl] --yes | export --out FILE
+  import --file FILE [--impl lnd|cl] [--dry-run] [--yes] | adopt [--yes] [--upgrade]
+  status [--refresh|--cached] [--raw-api] | check | detect | repair [--impl lnd|cl] --yes
+  uninstall --yes [--purge] | subscriptions-list | tick [--now ISO --no-persist] [--status-file FILE --no-persist]
 
 Key custody: the private key exists only in tunnelsats.conf (root 0600) and in the config
 tunnelsats.sh derives from it. It never appears in argv, environment variables, logs, JSON output,
@@ -25,7 +29,9 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import os
+import pwd
 import re
 import secrets
 import signal
@@ -76,6 +82,7 @@ CL_INSTALL_SERVICE = "/home/admin/config.scripts/cl.install-service.sh"
 LND_UNLOCK = "/home/admin/config.scripts/lnd.unlock.sh"
 CL_HSMTOOL = "/home/admin/config.scripts/cl.hsmtool.sh"
 LNCLI = ["sudo", "-u", "bitcoin", "/usr/local/bin/lncli", "-n=mainnet", "--rpcserver", "localhost:10009"]
+CLNCLI = ["sudo", "-u", "bitcoin", "/usr/local/bin/lightning-cli", "--conf=/home/bitcoin/.lightning/config"]
 UNIT_DIR = "/etc/systemd/system"
 LEGACY_CONF_RE = re.compile(r"/etc/wireguard/[A-Za-z0-9_.-]{1,64}\.conf")
 
@@ -84,6 +91,7 @@ API_SERVERS_URL = API_BASE_URL + "/servers"
 API_SUBSCRIPTION_URL = API_BASE_URL + "/subscription"
 API_CREATE_URL = API_BASE_URL + "/subscription/create"
 API_RENEW_URL = API_BASE_URL + "/subscription/renew"
+API_RESET_URL = API_BASE_URL + "/subscription/bandwidth-reset"
 API_CLAIM_URL = API_BASE_URL + "/subscription/claim"
 API_STATUS_URL = API_BASE_URL + "/subscription/status"
 API_CONNECT_TIMEOUT = 15
@@ -1572,6 +1580,47 @@ def cmd_import(deps, args, result):
     finish_with_check(deps, result, wait_until_started(deps, UNITS[impl]))
 
 
+def cmd_export(deps, args, result):
+    out_path = str(getattr(args, "out", "") or "").strip()
+    if not out_path or "\x00" in out_path:
+        raise ModuleError("E_USAGE", "usage", "invalid --out path", EXIT_USAGE)
+    if deps.root != "/" and out_path.startswith(deps.root):
+        target_path = out_path
+    elif out_path.startswith("/"):
+        target_path = deps.path(out_path)
+    else:
+        target_path = os.path.abspath(out_path)
+    if os.path.islink(target_path):
+        raise ModuleError("E_USAGE", "usage", "--out path must not be a symlink", EXIT_USAGE)
+    parent = os.path.dirname(target_path)
+    if not parent or not os.path.isdir(parent) or os.path.islink(parent):
+        raise ModuleError("E_USAGE", "usage", "parent directory of --out does not exist", EXIT_USAGE)
+    cfg = load_stored_config(deps)
+    state = load_state(deps)
+    if cfg is None:
+        raise ModuleError("E_NOT_CONFIGURED", "not_configured",
+                          "no stored WireGuard config to export", EXIT_NOT_CONFIGURED)
+    write_private(target_path, render_wg_config(cfg), mode=0o600)
+    owner_name = "admin"
+    if deps.root == "/":
+        try:
+            pw = pwd.getpwnam("admin")
+            os.chown(target_path, pw.pw_uid, pw.pw_gid)
+        except (KeyError, OSError):
+            pass
+    os.chmod(target_path, 0o600)
+    result.fields.update({
+        "exported": True,
+        "file": out_path,
+        "mode": "0600",
+        "owner": owner_name,
+        "public_key": cfg["public_key"],
+        "server_domain": (state or {}).get("server_domain") or cfg["endpoint_host"],
+        "vpn_port": cfg["vpn_port"],
+    })
+
+
+
 def finish_with_check(deps, result, wait=None):
     result.fields["ln_start_wait"] = wait
     checked = check_after_activation(deps, wait)
@@ -1619,7 +1668,8 @@ def _api_json_request(deps, url, payload=None):
 
 def poll_order_status(deps, payment_hash):
     """Polls GET /api/public/v1/subscription/{paymentHash}. Returns (outcome, status_str, doc, detail)
-    where outcome is 'ok', 'not_found', 'failed', or 'invalid'."""
+    where outcome is 'ok', 'not_found', 'failed', or 'invalid'. HTTP 202 (status 'processing') means
+    the payment is confirmed and the API is still provisioning or renewing: status_str 'processing'."""
     if not isinstance(payment_hash, str) or not HEX64_RE.fullmatch(payment_hash.lower()):
         return "invalid", None, None, "invalid paymentHash"
     try:
@@ -1628,8 +1678,10 @@ def poll_order_status(deps, payment_hash):
         if exc.exit_code == EXIT_API_UNAVAILABLE:
             return "failed", None, None, exc.message
         return "invalid", None, None, exc.message
-    if status == 200 and isinstance(doc, dict):
+    if status in (200, 202) and isinstance(doc, dict):
         raw_st = str(doc.get("status") or "").strip().lower()
+        if status == 202 or raw_st == "processing":
+            return "ok", "processing", doc, ""
         if raw_st in ("pending", "awaiting_payment", "unpaid"):
             return "ok", "pending", doc, ""
         if raw_st in ("paid", "claimed", "expired"):
@@ -1645,10 +1697,45 @@ def poll_order_status(deps, payment_hash):
     return "invalid", None, None, "unexpected API answer (HTTP %d)" % status
 
 
+def poll_reset_status(deps, payment_hash):
+    """Polls GET /api/public/v1/subscription/{paymentHash} for a bandwidth_reset invoice.
+    Returns (outcome, status_str, doc, detail) where outcome is 'ok', 'not_found', 'failed', or 'invalid'."""
+    if not isinstance(payment_hash, str) or not HEX64_RE.fullmatch(payment_hash.lower()):
+        return "invalid", None, None, "invalid paymentHash"
+    try:
+        status, headers, doc, _code = _api_json_request(deps, "%s/%s" % (API_SUBSCRIPTION_URL, payment_hash.lower()), None)
+    except ModuleError as exc:
+        if exc.exit_code == EXIT_API_UNAVAILABLE:
+            return "failed", None, None, exc.message
+        return "invalid", None, None, exc.message
+    if status in (200, 202) and isinstance(doc, dict):
+        doc_type = doc.get("type")
+        if doc_type is not None and str(doc_type).strip().lower() != "bandwidth_reset":
+            return "invalid", None, None, "unexpected subscription type for bandwidth reset"
+        raw_st = str(doc.get("status") or "").strip().lower()
+        if status == 202 or raw_st == "processing":
+            return "ok", "processing", doc, ""
+        if raw_st in ("pending", "awaiting_payment", "unpaid"):
+            return "ok", "pending", doc, ""
+        if raw_st in ("paid", "claimed", "expired", "failed"):
+            return "ok", raw_st, doc, ""
+        return "invalid", None, None, "unexpected reset status value"
+    if status == 404:
+        return "not_found", None, None, "reset not found"
+    if status == 429:
+        retry = headers.get("retry-after", "60")
+        return "failed", None, None, "rate limited, retry in %s s" % (retry if str(retry).isdigit() else "60")
+    if status >= 500:
+        return "failed", None, None, "the TunnelSats API is unavailable (HTTP %d)" % status
+    return "invalid", None, None, "unexpected API answer (HTTP %d)" % status
+
+
 def assemble_claimed_config(claim_doc, private_key, expected_public_key):
     """Concept 4.4 Claim Trust Boundary: validates individual fields of a /subscription/claim response,
     never reads fullConfig/config/peer.privateKey, verifies peer.publicKey matches the locally derived
-    public key, and builds and re-parses the canonical WireGuard config. Raises ModuleError(E_CLAIM_INVALID)."""
+    public key, and builds and re-parses the canonical WireGuard config. Raises ModuleError(E_CLAIM_INVALID).
+    The body of a client-held key order (API docs, ClaimResult): server {endpoint, publicKey, allowedIPs},
+    peer {address, publicKey, presharedKey}, vpnPort, subscriptionEnd."""
     def bad(msg):
         return ModuleError("E_CLAIM_INVALID", "invalid_response", msg, EXIT_INVALID_API)
 
@@ -1665,16 +1752,16 @@ def assemble_claimed_config(claim_doc, private_key, expected_public_key):
         raise bad("claim response is missing peer or server object")
     if peer.get("publicKey") != derived_pub:
         raise bad("claim peer.publicKey does not match local public key")
-    peer_ip_raw = peer.get("ip")
+    peer_ip_raw = peer.get("address")
     if not isinstance(peer_ip_raw, str) or not peer_ip_raw.strip():
-        raise bad("claim peer.ip is missing")
+        raise bad("claim peer.address is missing")
     peer_ip_str = peer_ip_raw.strip() if "/" in peer_ip_raw.strip() else peer_ip_raw.strip() + "/32"
     try:
         iface = ipaddress.IPv4Interface(peer_ip_str)
     except ValueError:
-        raise bad("claim peer.ip is not a valid IPv4 address") from None
+        raise bad("claim peer.address is not a valid IPv4 address") from None
     if iface.network.prefixlen != 32 or iface.ip not in ipaddress.IPv4Network("10.0.0.0/8"):
-        raise bad("claim peer.ip must be a /32 address inside 10.0.0.0/8")
+        raise bad("claim peer.address must be a /32 address inside 10.0.0.0/8")
     psk = peer.get("presharedKey")
     if psk is not None and psk != "":
         if not isinstance(psk, str) or not KEY_RE.fullmatch(psk.strip()):
@@ -1682,7 +1769,7 @@ def assemble_claimed_config(claim_doc, private_key, expected_public_key):
         psk = psk.strip()
     else:
         psk = None
-    vpn_port = peer.get("vpnPort") if peer.get("vpnPort") is not None else claim_doc.get("vpnPort")
+    vpn_port = claim_doc.get("vpnPort")
     if not valid_port(vpn_port):
         raise bad("claim vpnPort is missing or outside 1..65535")
     server_pub = server.get("publicKey")
@@ -1709,7 +1796,8 @@ def assemble_claimed_config(claim_doc, private_key, expected_public_key):
     allowed_ips = []
     for entry in allowed_parts:
         try:
-            allowed_ips.append(str(ipaddress.IPv4Network(entry, strict=False)))
+            # the rule of IMPORT (parse_wg_config): IPv4 and IPv6 networks, 0.0.0.0/0 required below
+            allowed_ips.append(str(ipaddress.ip_network(entry, strict=False)))
         except ValueError:
             raise bad("claim server.allowedIPs holds an invalid network") from None
     if "0.0.0.0/0" not in allowed_ips:
@@ -1798,9 +1886,9 @@ def cmd_buy(deps, args, result):
         raise ModuleError("E_USAGE", "usage", "--months must be 1, 3, 6, or 12", EXIT_USAGE)
     if args.pay not in PAY_MODES:
         raise ModuleError("E_USAGE", "usage", "--pay must be node, qr, copy, or none", EXIT_USAGE)
-    if args.pay == "node":
-        raise ModuleError("E_PAY_UNSUPPORTED", "refused",
-                          "node payment is not supported in this version; use --pay qr, copy, or none", EXIT_REFUSED)
+    if args.pay == "node" and not getattr(args, "yes", False):
+        raise ModuleError("E_CONFIRMATION_REQUIRED", "usage",
+                          "--pay node requires --yes (or create the invoice first and run pay-node --yes)", EXIT_USAGE)
     if load_state(deps) is not None:
         raise ModuleError("E_ALREADY_CONFIGURED", "refused",
                           "a subscription is already stored on this node: use renew or remove it first", EXIT_REFUSED)
@@ -1814,6 +1902,7 @@ def cmd_buy(deps, args, result):
         pending = prune_pending(deps)
         cur = pending.get("order")
         shred_first = False
+        reused = False
         if isinstance(cur, dict):
             if _item_protected_from_prune(cur):
                 raise ModuleError("E_ORDER_PENDING", "refused",
@@ -1826,80 +1915,84 @@ def cmd_buy(deps, args, result):
                 result.fields.update(_buy_fields(cur, reused=True))
                 if args.pay == "qr" and not args.json:
                     show_qr(deps, cur.get("invoice"))
-                return
-            if HEX64_RE.fullmatch(str(cur.get("payment_hash") or "")):
-                p_out, p_status, _p_doc, _p_det = poll_order_status(deps, cur["payment_hash"])
-                if p_out == "ok" and p_status in ("paid", "claimed"):
-                    cur["state"] = "paid"
-                    save_pending(deps, pending)
-                    raise ModuleError("E_ORDER_PENDING", "refused",
-                                      "the existing order has been paid: run settle to claim and activate it",
-                                      EXIT_REFUSED)
-            sup = dict(cur, state="superseded" if cur.get("state") == "awaiting_payment" else cur.get("state"))
-            retained = list(pending.get("retained_orders") or []) + [sup]
-            if len(retained) > MAX_RETAINED_ORDERS:
-                protected = [x for x in retained if _item_protected_from_prune(x)]
-                unprotected = [x for x in retained if not _item_protected_from_prune(x)]
-                keep_count = max(0, MAX_RETAINED_ORDERS - len(protected))
-                evicted = unprotected[:max(0, len(unprotected) - keep_count)]
-                if any(x.get("private_key") for x in evicted):
-                    shred_first = True
-                retained = protected + (unprotected[-keep_count:] if keep_count else [])
-            pending["retained_orders"] = retained
-            pending["order"] = None
-        priv_key, pub_key = generate_wg_keypair()
-        status, _headers, doc, _code = _api_json_request(
-            deps, API_CREATE_URL, {"serverId": args.server, "duration": args.months, "wgPublicKey": pub_key}
-        )
-        if status == 429:
-            raise ModuleError("E_RATE_LIMITED", "retryable", "rate limited by the TunnelSats API", EXIT_API_UNAVAILABLE)
-        if status >= 500:
-            raise ModuleError("E_API_UNAVAILABLE", "retryable",
-                              "the TunnelSats API is unavailable (HTTP %d)" % status, EXIT_API_UNAVAILABLE)
-        if status not in (200, 201) or not isinstance(doc, dict):
-            raise ModuleError("E_API_INVALID", "invalid_response",
-                              "unexpected create response (HTTP %d)" % status, EXIT_INVALID_API)
-        payment_hash = str(doc.get("paymentHash") or "").strip().lower()
-        if not HEX64_RE.fullmatch(payment_hash):
-            raise ModuleError("E_API_INVALID", "invalid_response",
-                              "create response is missing a 64-hex paymentHash", EXIT_INVALID_API)
-        raw_order_id = doc.get("orderId") if doc.get("orderId") is not None else doc.get("id")
-        order_id = str(raw_order_id).strip() if raw_order_id is not None else payment_hash[:16]
-        if not ORDER_ID_RE.fullmatch(order_id):
-            raise ModuleError("E_API_INVALID", "invalid_response",
-                              "create response has an invalid orderId", EXIT_INVALID_API)
-        invoice = doc.get("invoice") if doc.get("invoice") is not None else doc.get("paymentRequest")
-        api_sats = doc.get("amountSats")
-        if isinstance(api_sats, bool) or not isinstance(api_sats, int) or api_sats <= 0:
-            raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
-                              "create response is missing a positive integer amountSats", EXIT_INVALID_API)
-        decoded = verify_bolt11_invoice(invoice, payment_hash, expected_sats=api_sats)
-        now = deps.clock()
-        created_at = iso(now)
-        exp_dt = now + datetime.timedelta(seconds=decoded["expiry_seconds"])
-        ret_dt = now + datetime.timedelta(seconds=PENDING_TTL_SECONDS)
-        order_record = {
-            "order_id": order_id,
-            "payment_hash": payment_hash,
-            "invoice": invoice.strip(),
-            "amount_sats": decoded["amount_sats"],
-            "server_id": args.server,
-            "months": args.months,
-            "impl": impl,
-            "private_key": priv_key,
-            "public_key": pub_key,
-            "created_at": created_at,
-            "invoice_expires_at": iso(exp_dt),
-            "retained_until": iso(ret_dt),
-            "state": "awaiting_payment",
-            "node_payment": {"state": "none", "result": None},
-        }
-        pending["order"] = order_record
-        save_pending(deps, pending, shred_first=shred_first)
-        deps.run([ITS, "tick-timer", "on"], timeout=60)
-        result.fields.update(_buy_fields(order_record, reused=False))
-        if args.pay == "qr" and not args.json:
-            show_qr(deps, order_record["invoice"])
+                reused = True
+            else:
+                if HEX64_RE.fullmatch(str(cur.get("payment_hash") or "")):
+                    p_out, p_status, _p_doc, _p_det = poll_order_status(deps, cur["payment_hash"])
+                    if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
+                        cur["state"] = "paid"
+                        save_pending(deps, pending)
+                        raise ModuleError("E_ORDER_PENDING", "refused",
+                                          "the existing order has been paid: run settle to claim and activate it",
+                                          EXIT_REFUSED)
+                sup = dict(cur, state="superseded" if cur.get("state") == "awaiting_payment" else cur.get("state"))
+                retained = list(pending.get("retained_orders") or []) + [sup]
+                if len(retained) > MAX_RETAINED_ORDERS:
+                    protected = [x for x in retained if _item_protected_from_prune(x)]
+                    unprotected = [x for x in retained if not _item_protected_from_prune(x)]
+                    keep_count = max(0, MAX_RETAINED_ORDERS - len(protected))
+                    evicted = unprotected[:max(0, len(unprotected) - keep_count)]
+                    if any(x.get("private_key") for x in evicted):
+                        shred_first = True
+                    retained = protected + (unprotected[-keep_count:] if keep_count else [])
+                pending["retained_orders"] = retained
+                pending["order"] = None
+        if not reused:
+            priv_key, pub_key = generate_wg_keypair()
+            status, _headers, doc, _code = _api_json_request(
+                deps, API_CREATE_URL, {"serverId": args.server, "duration": args.months, "wgPublicKey": pub_key}
+            )
+            if status == 429:
+                raise ModuleError("E_RATE_LIMITED", "retryable", "rate limited by the TunnelSats API", EXIT_API_UNAVAILABLE)
+            if status >= 500:
+                raise ModuleError("E_API_UNAVAILABLE", "retryable",
+                                  "the TunnelSats API is unavailable (HTTP %d)" % status, EXIT_API_UNAVAILABLE)
+            if status not in (200, 201) or not isinstance(doc, dict):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "unexpected create response (HTTP %d)" % status, EXIT_INVALID_API)
+            payment_hash = str(doc.get("paymentHash") or "").strip().lower()
+            if not HEX64_RE.fullmatch(payment_hash):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "create response is missing a 64-hex paymentHash", EXIT_INVALID_API)
+            raw_order_id = doc.get("orderId") if doc.get("orderId") is not None else doc.get("id")
+            order_id = str(raw_order_id).strip() if raw_order_id is not None else payment_hash[:16]
+            if not ORDER_ID_RE.fullmatch(order_id):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "create response has an invalid orderId", EXIT_INVALID_API)
+            invoice = doc.get("invoice") if doc.get("invoice") is not None else doc.get("paymentRequest")
+            api_sats = doc.get("amountSats")
+            if isinstance(api_sats, bool) or not isinstance(api_sats, int) or api_sats <= 0:
+                raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                                  "create response is missing a positive integer amountSats", EXIT_INVALID_API)
+            decoded = verify_bolt11_invoice(invoice, payment_hash, expected_sats=api_sats)
+            now = deps.clock()
+            created_at = iso(now)
+            exp_dt = now + datetime.timedelta(seconds=decoded["expiry_seconds"])
+            ret_dt = now + datetime.timedelta(seconds=PENDING_TTL_SECONDS)
+            order_record = {
+                "order_id": order_id,
+                "payment_hash": payment_hash,
+                "invoice": invoice.strip(),
+                "amount_sats": decoded["amount_sats"],
+                "server_id": args.server,
+                "months": args.months,
+                "impl": impl,
+                "private_key": priv_key,
+                "public_key": pub_key,
+                "created_at": created_at,
+                "invoice_expires_at": iso(exp_dt),
+                "retained_until": iso(ret_dt),
+                "state": "awaiting_payment",
+                "node_payment": {"state": "none", "result": None},
+            }
+            pending["order"] = order_record
+            save_pending(deps, pending, shred_first=shred_first)
+            deps.run([ITS, "tick-timer", "on"], timeout=60)
+            result.fields.update(_buy_fields(order_record, reused=False))
+            if args.pay == "qr" and not args.json:
+                show_qr(deps, order_record["invoice"])
+    if args.pay == "node":
+        _pay_pending_item_via_node(deps, "order", impl, result)
 
 
 def _renew_fields(renewal, reused=False):
@@ -1936,9 +2029,9 @@ def cmd_renew(deps, args, result):
         raise ModuleError("E_USAGE", "usage", "--months must be 1, 3, 6, or 12", EXIT_USAGE)
     if args.pay not in PAY_MODES:
         raise ModuleError("E_USAGE", "usage", "--pay must be node, qr, copy, or none", EXIT_USAGE)
-    if args.pay == "node":
-        raise ModuleError("E_PAY_UNSUPPORTED", "refused",
-                          "node payment is not supported in this version; use --pay qr, copy, or none", EXIT_REFUSED)
+    if args.pay == "node" and not getattr(args, "yes", False):
+        raise ModuleError("E_CONFIRMATION_REQUIRED", "usage",
+                          "--pay node requires --yes (or create the invoice first and run pay-node --yes)", EXIT_USAGE)
     state = load_state(deps)
     if state is None or not state.get("public_key"):
         raise ModuleError("E_NOT_CONFIGURED", "not_configured",
@@ -1951,6 +2044,7 @@ def cmd_renew(deps, args, result):
     with Lock(deps, wait=30):
         pending = prune_pending(deps)
         cur = pending.get("renewal")
+        reused = False
         if isinstance(cur, dict):
             if _item_protected_from_prune(cur):
                 raise ModuleError("E_RENEWAL_PENDING", "refused",
@@ -1963,69 +2057,225 @@ def cmd_renew(deps, args, result):
                 result.fields.update(_renew_fields(cur, reused=True))
                 if args.pay == "qr" and not args.json:
                     show_qr(deps, cur.get("invoice"))
-                return
-        status, _headers, doc, code = _api_json_request(
-            deps, API_RENEW_URL,
-            {"serverId": server_id, "duration": args.months, "wgPublicKey": state["public_key"]},
-        )
-        if status == 404 and code == "ERR_RESOURCE_NOT_FOUND":
-            raise ModuleError("E_UNKNOWN_KEY", "refused",
-                              "TunnelSats knows no subscription for this key", EXIT_REFUSED)
-        if status == 403 and code == "ERR_MIGRATION_REQUIRED":
-            raise ModuleError("E_MIGRATION_REQUIRED", "refused",
-                              "this subscription has to be migrated on tunnelsats.com first", EXIT_REFUSED)
-        if status == 429:
-            raise ModuleError("E_RATE_LIMITED", "retryable", "rate limited by the TunnelSats API", EXIT_API_UNAVAILABLE)
-        if status >= 500:
-            raise ModuleError("E_API_UNAVAILABLE", "retryable",
-                              "the TunnelSats API is unavailable (HTTP %d)" % status, EXIT_API_UNAVAILABLE)
-        if status not in (200, 201) or not isinstance(doc, dict):
-            raise ModuleError("E_API_INVALID", "invalid_response",
-                              "unexpected renew response (HTTP %d)" % status, EXIT_INVALID_API)
-        payment_hash = str(doc.get("paymentHash") or "").strip().lower()
-        if not HEX64_RE.fullmatch(payment_hash):
-            raise ModuleError("E_API_INVALID", "invalid_response",
-                              "renew response is missing a 64-hex paymentHash", EXIT_INVALID_API)
-        raw_id = doc.get("renewalId") if doc.get("renewalId") is not None else doc.get("orderId")
-        renewal_id = str(raw_id).strip() if raw_id is not None else payment_hash[:16]
-        if not ORDER_ID_RE.fullmatch(renewal_id):
-            raise ModuleError("E_API_INVALID", "invalid_response",
-                              "renew response has an invalid renewalId", EXIT_INVALID_API)
-        invoice = doc.get("invoice") if doc.get("invoice") is not None else doc.get("paymentRequest")
-        api_sats = doc.get("amountSats")
-        decoded = verify_bolt11_invoice(invoice, payment_hash, expected_sats=api_sats, max_sats=MAX_RENEW_SATS)
-        now = deps.clock()
-        new_expiry = doc.get("newExpiry") or doc.get("subscriptionEnd")
-        if not (isinstance(new_expiry, str) and parse_iso(new_expiry) is not None):
-            base_dt = parse_iso(old_expiry)
-            if base_dt is None and isinstance(old_expiry, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", old_expiry):
-                base_dt = parse_iso(old_expiry + "T00:00:00Z")
-            base_dt = max(base_dt, now) if base_dt is not None else now
-            new_expiry = iso(base_dt + datetime.timedelta(days=30 * args.months))
-        exp_dt = now + datetime.timedelta(seconds=decoded["expiry_seconds"])
-        ret_dt = now + datetime.timedelta(seconds=PENDING_TTL_SECONDS)
-        renewal_record = {
-            "renewal_id": renewal_id,
-            "payment_hash": payment_hash,
-            "invoice": invoice.strip(),
-            "amount_sats": decoded["amount_sats"],
-            "server_id": server_id,
-            "months": args.months,
-            "old_expiry": old_expiry,
-            "new_expiry": new_expiry,
-            "public_key": state["public_key"],
-            "created_at": iso(now),
-            "invoice_expires_at": iso(exp_dt),
-            "retained_until": iso(ret_dt),
-            "state": "awaiting_payment",
-            "node_payment": {"state": "none", "result": None},
-        }
-        pending["renewal"] = renewal_record
-        save_pending(deps, pending)
-        deps.run([ITS, "tick-timer", "on"], timeout=60)
-        result.fields.update(_renew_fields(renewal_record, reused=False))
-        if args.pay == "qr" and not args.json:
-            show_qr(deps, renewal_record["invoice"])
+                reused = True
+            elif HEX64_RE.fullmatch(str(cur.get("payment_hash") or "")):
+                p_out, p_status, _p_doc, _p_det = poll_order_status(deps, cur["payment_hash"])
+                if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
+                    cur["state"] = "paid"
+                    save_pending(deps, pending)
+                    raise ModuleError("E_RENEWAL_PENDING", "refused",
+                                      "the existing renewal has been paid: run settle first",
+                                      EXIT_REFUSED)
+        if not reused:
+            status, _headers, doc, code = _api_json_request(
+                deps, API_RENEW_URL,
+                {"serverId": server_id, "duration": args.months, "wgPublicKey": state["public_key"]},
+            )
+            if status == 404 and code == "ERR_RESOURCE_NOT_FOUND":
+                raise ModuleError("E_UNKNOWN_KEY", "refused",
+                                  "TunnelSats knows no subscription for this key", EXIT_REFUSED)
+            if status == 403 and code == "ERR_MIGRATION_REQUIRED":
+                raise ModuleError("E_MIGRATION_REQUIRED", "refused",
+                                  "this subscription has to be migrated on tunnelsats.com first", EXIT_REFUSED)
+            if status == 429:
+                raise ModuleError("E_RATE_LIMITED", "retryable", "rate limited by the TunnelSats API", EXIT_API_UNAVAILABLE)
+            if status >= 500:
+                raise ModuleError("E_API_UNAVAILABLE", "retryable",
+                                  "the TunnelSats API is unavailable (HTTP %d)" % status, EXIT_API_UNAVAILABLE)
+            if status not in (200, 201) or not isinstance(doc, dict):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "unexpected renew response (HTTP %d)" % status, EXIT_INVALID_API)
+            payment_hash = str(doc.get("paymentHash") or "").strip().lower()
+            if not HEX64_RE.fullmatch(payment_hash):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "renew response is missing a 64-hex paymentHash", EXIT_INVALID_API)
+            raw_id = doc.get("renewalId") if doc.get("renewalId") is not None else doc.get("orderId")
+            renewal_id = str(raw_id).strip() if raw_id is not None else payment_hash[:16]
+            if not ORDER_ID_RE.fullmatch(renewal_id):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "renew response has an invalid renewalId", EXIT_INVALID_API)
+            invoice = doc.get("invoice") if doc.get("invoice") is not None else doc.get("paymentRequest")
+            api_sats = doc.get("amountSats")
+            decoded = verify_bolt11_invoice(invoice, payment_hash, expected_sats=api_sats, max_sats=MAX_RENEW_SATS)
+            now = deps.clock()
+            new_expiry = doc.get("newExpiry") or doc.get("subscriptionEnd")
+            if not (isinstance(new_expiry, str) and parse_iso(new_expiry) is not None):
+                base_dt = parse_iso(old_expiry)
+                if base_dt is None and isinstance(old_expiry, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", old_expiry):
+                    base_dt = parse_iso(old_expiry + "T00:00:00Z")
+                base_dt = max(base_dt, now) if base_dt is not None else now
+                new_expiry = iso(base_dt + datetime.timedelta(days=30 * args.months))
+            exp_dt = now + datetime.timedelta(seconds=decoded["expiry_seconds"])
+            ret_dt = now + datetime.timedelta(seconds=PENDING_TTL_SECONDS)
+            renewal_record = {
+                "renewal_id": renewal_id,
+                "payment_hash": payment_hash,
+                "invoice": invoice.strip(),
+                "amount_sats": decoded["amount_sats"],
+                "server_id": server_id,
+                "months": args.months,
+                "old_expiry": old_expiry,
+                "new_expiry": new_expiry,
+                "public_key": state["public_key"],
+                "created_at": iso(now),
+                "invoice_expires_at": iso(exp_dt),
+                "retained_until": iso(ret_dt),
+                "state": "awaiting_payment",
+                "node_payment": {"state": "none", "result": None},
+            }
+            pending["renewal"] = renewal_record
+            save_pending(deps, pending)
+            deps.run([ITS, "tick-timer", "on"], timeout=60)
+            result.fields.update(_renew_fields(renewal_record, reused=False))
+            if args.pay == "qr" and not args.json:
+                show_qr(deps, renewal_record["invoice"])
+    if args.pay == "node":
+        _pay_pending_item_via_node(deps, "renewal", getattr(args, "impl", None), result)
+
+
+def _reset_fields(reset, reused=False):
+    return {
+        "state": reset["state"],
+        "reused": reused,
+        "reset_id": reset["reset_id"],
+        "payment_hash": reset["payment_hash"],
+        "server_id": reset["server_id"],
+        "amount_sats": reset["amount_sats"],
+        "amount_check": {
+            "match": True,
+            "invoice_sats": reset["amount_sats"],
+            "api_sats": reset["amount_sats"],
+        },
+        "public_key": reset["public_key"],
+        "created_at": reset["created_at"],
+        "invoice_expires_at": reset["invoice_expires_at"],
+        "retained_until": reset["retained_until"],
+        "old_resets": reset.get("old_resets"),
+        "old_used_gb": reset.get("old_used_gb"),
+        "node_payment": dict(reset.get("node_payment") or {"state": "none", "result": None}),
+    }
+
+
+def cmd_topup(deps, args, result):
+    if args.pay not in PAY_MODES:
+        raise ModuleError("E_USAGE", "usage", "--pay must be node, qr, copy, or none", EXIT_USAGE)
+    if args.pay == "node" and not getattr(args, "yes", False):
+        raise ModuleError("E_CONFIRMATION_REQUIRED", "usage",
+                          "--pay node requires --yes (or create the invoice first and run pay-node --yes)", EXIT_USAGE)
+    state = load_state(deps)
+    if state is None or not state.get("public_key"):
+        raise ModuleError("E_NOT_CONFIGURED", "not_configured",
+                          "no TunnelSats subscription is stored on this node", EXIT_NOT_CONFIGURED)
+    server_id = _derive_server_id(state)
+    if not SERVER_ID_RE.fullmatch(server_id):
+        raise ModuleError("E_STORED_CONFIG", "operational",
+                          "stored server domain is missing or invalid", EXIT_OPERATIONAL)
+    api_data = ((state.get("api") or {}).get("data") or {})
+    old_resets = api_data.get("resets_this_month")
+    old_used_gb = api_data.get("bandwidth_used_gb")
+    with Lock(deps, wait=30):
+        pending = prune_pending(deps)
+        cur = pending.get("reset")
+        reused = False
+        if isinstance(cur, dict):
+            if _item_protected_from_prune(cur):
+                raise ModuleError("E_ORDER_PENDING", "refused",
+                                  "an existing bandwidth reset is already paid or awaiting confirmation: run settle first",
+                                  EXIT_REFUSED)
+            exp = parse_iso(cur.get("invoice_expires_at"))
+            if (cur.get("state") == "awaiting_payment" and cur.get("public_key") == state["public_key"]
+                    and exp and deps.clock() < exp):
+                if HEX64_RE.fullmatch(str(cur.get("payment_hash") or "")):
+                    p_out, p_status, _p_doc, _p_det = poll_reset_status(deps, cur["payment_hash"])
+                    if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
+                        cur["state"] = "paid"
+                        save_pending(deps, pending)
+                        raise ModuleError("E_ORDER_PENDING", "refused",
+                                          "the existing bandwidth reset has been paid: run settle first",
+                                          EXIT_REFUSED)
+                    if p_out == "ok" and p_status == "failed":
+                        cur["state"] = "needs_support"
+                        cur["error_code"] = "E_RESET_FAILED"
+                        cur["error_detail"] = "bandwidth reset failed on server after payment"
+                        save_pending(deps, pending)
+                        raise ModuleError("E_RESET_FAILED", "invalid_response", cur["error_detail"], EXIT_INVALID_API)
+                deps.run([ITS, "tick-timer", "on"], timeout=60)
+                result.fields.update(_reset_fields(cur, reused=True))
+                if args.pay == "qr" and not args.json:
+                    show_qr(deps, cur.get("invoice"))
+                reused = True
+            elif HEX64_RE.fullmatch(str(cur.get("payment_hash") or "")):
+                p_out, p_status, _p_doc, _p_det = poll_reset_status(deps, cur["payment_hash"])
+                if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
+                    cur["state"] = "paid"
+                    save_pending(deps, pending)
+                    raise ModuleError("E_ORDER_PENDING", "refused",
+                                      "the existing bandwidth reset has been paid: run settle first",
+                                      EXIT_REFUSED)
+        if not reused:
+            status, _headers, doc, code = _api_json_request(
+                deps, API_RESET_URL, {"wgPublicKey": state["public_key"], "serverId": server_id}
+            )
+            if status == 404 and code == "ERR_RESOURCE_NOT_FOUND":
+                raise ModuleError("E_UNKNOWN_KEY", "refused",
+                                  "TunnelSats knows no subscription for this key", EXIT_REFUSED)
+            if status == 403 and code == "ERR_MIGRATION_REQUIRED":
+                raise ModuleError("E_MIGRATION_REQUIRED", "refused",
+                                  "this subscription has to be migrated on tunnelsats.com first", EXIT_REFUSED)
+            if status == 429:
+                err_msg = str((doc or {}).get("message") or (doc or {}).get("error") or "")
+                if code == "ERR_RESET_LIMIT_REACHED" or re.search(r"\bresets per month reached\b", err_msg, re.IGNORECASE):
+                    raise ModuleError("E_RESET_LIMIT", "refused",
+                                      "monthly bandwidth reset limit reached", EXIT_REFUSED)
+                raise ModuleError("E_RATE_LIMITED", "retryable", "rate limited by the TunnelSats API", EXIT_API_UNAVAILABLE)
+            if status >= 500:
+                raise ModuleError("E_API_UNAVAILABLE", "retryable",
+                                  "the TunnelSats API is unavailable (HTTP %d)" % status, EXIT_API_UNAVAILABLE)
+            if status not in (200, 201) or not isinstance(doc, dict):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "unexpected bandwidth-reset response (HTTP %d)" % status, EXIT_INVALID_API)
+            payment_hash = str(doc.get("paymentHash") or "").strip().lower()
+            if not HEX64_RE.fullmatch(payment_hash):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "bandwidth-reset response is missing a 64-hex paymentHash", EXIT_INVALID_API)
+            raw_id = doc.get("resetId") if doc.get("resetId") is not None else doc.get("orderId")
+            reset_id = str(raw_id).strip() if raw_id is not None else payment_hash[:16]
+            if not ORDER_ID_RE.fullmatch(reset_id):
+                raise ModuleError("E_API_INVALID", "invalid_response",
+                                  "bandwidth-reset response has an invalid resetId", EXIT_INVALID_API)
+            invoice = doc.get("invoice") if doc.get("invoice") is not None else doc.get("paymentRequest")
+            api_sats = doc.get("amountSats")
+            if isinstance(api_sats, bool) or not isinstance(api_sats, int) or api_sats <= 0:
+                raise ModuleError("E_INVOICE_MISMATCH", "invalid_response",
+                                  "bandwidth-reset response is missing a positive integer amountSats", EXIT_INVALID_API)
+            decoded = verify_bolt11_invoice(invoice, payment_hash, expected_sats=api_sats)
+            now = deps.clock()
+            api_exp = parse_iso(doc.get("expiresAt"))
+            exp_dt = api_exp if (api_exp is not None and api_exp > now) else (now + datetime.timedelta(seconds=decoded["expiry_seconds"]))
+            ret_dt = now + datetime.timedelta(seconds=PENDING_TTL_SECONDS)
+            reset_record = {
+                "reset_id": reset_id,
+                "payment_hash": payment_hash,
+                "invoice": invoice.strip(),
+                "amount_sats": decoded["amount_sats"],
+                "server_id": server_id,
+                "public_key": state["public_key"],
+                "created_at": iso(now),
+                "invoice_expires_at": iso(exp_dt),
+                "retained_until": iso(ret_dt),
+                "state": "awaiting_payment",
+                "old_resets": old_resets,
+                "old_used_gb": old_used_gb,
+                "node_payment": {"state": "none", "result": None},
+            }
+            pending["reset"] = reset_record
+            save_pending(deps, pending)
+            deps.run([ITS, "tick-timer", "on"], timeout=60)
+            result.fields.update(_reset_fields(reset_record, reused=False))
+            if args.pay == "qr" and not args.json:
+                show_qr(deps, reset_record["invoice"])
+    if args.pay == "node":
+        _pay_pending_item_via_node(deps, "reset", getattr(args, "impl", None), result)
 
 
 def cmd_invoice(deps, args, result):
@@ -2116,6 +2366,11 @@ def _claim_and_store_order(deps, pending, order, result, foreground=True, notify
         order["error_detail"] = "claim conflict (HTTP 409): public key or order was already claimed"
         save_pending(deps, pending)
         raise ModuleError("E_CLAIM_CONFLICT", "invalid_response", order["error_detail"], EXIT_INVALID_API)
+    if status in (202, 402) or (isinstance(doc, dict) and str(doc.get("status") or "").strip().lower() == "processing"):
+        # 202: paid, the API still provisions the tunnel; 402: the API does not see the payment yet.
+        # Both ask the client to retry the claim, so the order stays in claiming for the next pass.
+        return {"done": False, "kind": "order", "state": "claiming",
+                "payment_hash": order["payment_hash"], "retryable": True}
     if status >= 500 or status == 429:
         if foreground:
             raise ModuleError("E_API_UNAVAILABLE", "retryable",
@@ -2195,11 +2450,12 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
     pending = prune_pending(deps)
     order = pending.get("order")
     renewal = pending.get("renewal")
+    reset = pending.get("reset")
     retained = pending.get("retained_orders") or []
-    if not order and not renewal and not retained:
+    if not order and not renewal and not reset and not retained:
         if foreground:
             raise ModuleError("E_NO_PENDING", "not_configured",
-                              "no pending order or renewal to settle", EXIT_NOT_CONFIGURED)
+                              "no pending order, renewal, or reset to settle", EXIT_NOT_CONFIGURED)
         return {"done": False, "kind": None, "state": "none"}, None
 
     # 1. Active order
@@ -2212,7 +2468,7 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
                     "payment_hash": order.get("payment_hash")}, None
         if order.get("state") in ("awaiting_payment", "expired_unpaid"):
             p_out, p_status, _p_doc, _p_det = poll_order_status(deps, order.get("payment_hash"))
-            if p_out == "ok" and p_status in ("paid", "claimed"):
+            if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                 order["state"] = "paid"
                 save_pending(deps, pending)
                 if notify_event and not order.get("payment_notified"):
@@ -2247,7 +2503,7 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
                 continue
             if ret_order.get("state") in ("awaiting_payment", "superseded", "expired_unpaid"):
                 p_out, p_status, _p_doc, _p_det = poll_order_status(deps, ret_order.get("payment_hash"))
-                if p_out == "ok" and p_status in ("paid", "claimed"):
+                if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                     ret_order["state"] = "paid"
                     save_pending(deps, pending)
             if ret_order.get("state") in ("paid", "claiming"):
@@ -2273,7 +2529,7 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
     if outcome_dict is None and isinstance(renewal, dict):
         if renewal.get("state") in ("awaiting_payment", "expired_unpaid"):
             p_out, p_status, _p_doc, _p_det = poll_order_status(deps, renewal.get("payment_hash"))
-            if p_out == "ok" and p_status in ("paid", "claimed"):
+            if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
                 renewal["state"] = "paid"
                 save_pending(deps, pending)
                 if notify_event and not renewal.get("payment_notified"):
@@ -2321,9 +2577,106 @@ def _settle_once_inner(deps, result, foreground=True, notify_event=None):
                     "renewal_id": renewal.get("renewal_id"), "payment_hash": renewal.get("payment_hash"),
                 }
 
+    # 4. Bandwidth reset
+    if outcome_dict is None and isinstance(reset, dict):
+        if reset.get("state") == "needs_support":
+            if foreground:
+                raise ModuleError(reset.get("error_code") or "E_RESET_FAILED", "invalid_response",
+                                  reset.get("error_detail") or "bandwidth reset requires support", EXIT_INVALID_API)
+            return {"done": False, "kind": "reset", "state": "needs_support",
+                    "payment_hash": reset.get("payment_hash")}, None
+        polled_reset = False
+        p_out, p_status = None, None
+        if reset.get("state") in ("awaiting_payment", "expired_unpaid"):
+            polled_reset = True
+            p_out, p_status, _p_doc, _p_det = poll_reset_status(deps, reset.get("payment_hash"))
+            if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
+                reset["state"] = "paid"
+                save_pending(deps, pending)
+                if notify_event and not reset.get("payment_notified"):
+                    reset["payment_notified"] = True
+                    save_pending(deps, pending)
+                    notify_event("payment_received", reset.get("payment_hash"))
+            elif p_out == "ok" and p_status == "failed":
+                reset["state"] = "needs_support"
+                reset["error_code"] = "E_RESET_FAILED"
+                reset["error_detail"] = "bandwidth reset failed on server after payment"
+                save_pending(deps, pending)
+                if foreground:
+                    raise ModuleError("E_RESET_FAILED", "invalid_response", reset["error_detail"], EXIT_INVALID_API)
+                return {"done": False, "kind": "reset", "state": "needs_support",
+                        "payment_hash": reset.get("payment_hash")}, None
+            elif p_out == "ok" and p_status == "expired" and not _item_protected_from_prune(reset):
+                reset["state"] = "expired_unpaid"
+                save_pending(deps, pending)
+        if reset.get("state") == "paid":
+            if notify_event and not reset.get("payment_notified"):
+                reset["payment_notified"] = True
+                save_pending(deps, pending)
+                notify_event("payment_received", reset.get("payment_hash"))
+            if not polled_reset:
+                p_out, p_status, _p_doc, _p_det = poll_reset_status(deps, reset.get("payment_hash"))
+                if p_out == "ok" and p_status == "failed":
+                    reset["state"] = "needs_support"
+                    reset["error_code"] = "E_RESET_FAILED"
+                    reset["error_detail"] = "bandwidth reset failed on server after payment"
+                    save_pending(deps, pending)
+                    if foreground:
+                        raise ModuleError("E_RESET_FAILED", "invalid_response", reset["error_detail"], EXIT_INVALID_API)
+                    return {"done": False, "kind": "reset", "state": "needs_support",
+                            "payment_hash": reset.get("payment_hash")}, None
+            if p_out == "ok" and p_status == "processing":
+                outcome_dict = {
+                    "done": False, "kind": "reset", "state": "paid",
+                    "reset_id": reset.get("reset_id"), "payment_hash": reset.get("payment_hash"),
+                }
+            else:
+                s_out, s_data, _s_det = api_status(deps, reset.get("public_key"))
+                old_resets = reset.get("old_resets")
+                old_used = reset.get("old_used_gb")
+                new_resets = (s_data or {}).get("resets_this_month") if s_out == "confirmed" else None
+                new_used = (s_data or {}).get("bandwidth_used_gb") if s_out == "confirmed" else None
+                reset_applied = (
+                    s_out == "confirmed"
+                    and (
+                        p_status in ("paid", "claimed")
+                        or (is_count(old_resets) and is_count(new_resets) and new_resets > old_resets)
+                        or (is_number(old_used) and is_number(new_used) and new_used < old_used)
+                    )
+                )
+                if reset_applied:
+                    state = load_state(deps) or {}
+                    state["valid_until"] = s_data["expiry"]
+                    state["api"] = {"outcome": "confirmed", "checked_at": now_iso(deps),
+                                    "data": s_data, "confirmed_at": now_iso(deps)}
+                    if isinstance(state.get("notify_state"), dict):
+                        state["notify_state"]["bandwidth_cycle"] = "%s:%s" % (
+                            s_data.get("expiry") or state.get("valid_until") or "",
+                            s_data.get("resets_this_month", 0),
+                        )
+                        for ev in ("bandwidth_high", "bandwidth_exhausted"):
+                            (state["notify_state"].get("events") or {}).pop(ev, None)
+                    save_state(deps, state)
+                    pending["reset"] = None
+                    save_pending(deps, pending)
+                    outcome_dict = {
+                        "done": True, "kind": "reset", "state": "confirmed",
+                        "reset_id": reset.get("reset_id"), "payment_hash": reset.get("payment_hash"),
+                        "bandwidth_used_gb": s_data.get("bandwidth_used_gb"),
+                        "bandwidth_limit_gb": s_data.get("bandwidth_limit_gb"),
+                        "resets_this_month": s_data.get("resets_this_month"),
+                        "max_resets_per_month": s_data.get("max_resets_per_month"),
+                        "peer_status": s_data.get("peer_status"),
+                    }
+                else:
+                    outcome_dict = {
+                        "done": False, "kind": "reset", "state": "paid",
+                        "reset_id": reset.get("reset_id"), "payment_hash": reset.get("payment_hash"),
+                    }
+
     if outcome_dict is None:
-        active_item = order or renewal or (retained[0] if retained else {})
-        kind = "order" if (order or retained) else "renewal"
+        active_item = order or renewal or reset or (retained[0] if retained else {})
+        kind = "order" if (order or retained) else ("renewal" if renewal else "reset")
         outcome_dict = {
             "done": False, "kind": kind, "state": active_item.get("state", "awaiting_payment"),
             "payment_hash": active_item.get("payment_hash"),
@@ -2363,6 +2716,420 @@ def cmd_settle(deps, args, result):
         step = min(5, wait_seconds - waited)
         deps.sleep(step)
         waited += step
+
+
+# ------------------------------------------------------------------------------------------
+# pay-node (LND and Core Lightning invoice payment with preflight and 1% fee cap)
+# ------------------------------------------------------------------------------------------
+
+def _parse_last_json(text):
+    """Returns the last JSON object in text (e.g. from lncli payinvoice --json), or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    one = parse_one_json(text)
+    if one is not None:
+        return one
+    decoder = json.JSONDecoder()
+    last_doc = None
+    pos = 0
+    while True:
+        idx = text.find("{", pos)
+        if idx < 0:
+            break
+        try:
+            doc, end = decoder.raw_decode(text, idx)
+            if isinstance(doc, dict):
+                last_doc = doc
+                pos = max(idx + 1, end)
+                continue
+        except ValueError:
+            pass
+        pos = idx + 1
+    return last_doc
+
+
+def _parse_msat(value):
+    """Parses a Core Lightning msat value (integer or '<N>msat' string) into an int, or None."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw.endswith("msat"):
+            raw = raw[:-4]
+        if raw.isdigit():
+            return int(raw)
+    return None
+
+
+def _verify_preimage(preimage_hex, expected_payment_hash):
+    """True when preimage_hex is 64 hex chars whose SHA-256 equals expected_payment_hash."""
+    if not isinstance(preimage_hex, str) or not HEX64_RE.fullmatch(preimage_hex.strip().lower()):
+        return False
+    digest = hashlib.sha256(bytes.fromhex(preimage_hex.strip().lower())).hexdigest()
+    return digest == expected_payment_hash.lower()
+
+
+def _map_lnd_pay_error(doc, stdout_text, stderr_text):
+    combined = " ".join([
+        str((doc or {}).get("failure_reason") or ""),
+        str((doc or {}).get("payment_error") or ""),
+        str(stdout_text or ""),
+        str(stderr_text or ""),
+    ]).lower()
+    if any(k in combined for k in ("failure_reason_no_route", "no_route", "no route", "unable to find a path")):
+        return "E_PAY_NO_ROUTE"
+    if any(k in combined for k in ("failure_reason_insufficient_balance", "insufficient_balance",
+                                   "insufficient local balance", "insufficient balance", "channel balance")):
+        return "E_PAY_INSUFFICIENT_BALANCE"
+    if any(k in combined for k in ("failure_reason_timeout", "timeout", "timed out")):
+        return "E_PAY_TIMEOUT"
+    if any(k in combined for k in ("failure_reason_incorrect_payment_details", "incorrect_payment_details",
+                                   "unknown_payment_hash")):
+        return "E_PAY_INCORRECT_DETAILS"
+    if "expired" in combined:
+        return "E_PAY_EXPIRED"
+    return "E_PAY_ERROR"
+
+
+def _map_cln_pay_error(doc, stdout_text, stderr_text):
+    code = doc.get("code") if isinstance(doc, dict) else None
+    combined = " ".join([
+        str((doc or {}).get("message") or ""),
+        str(stdout_text or ""),
+        str(stderr_text or ""),
+    ]).lower()
+    if any(k in combined for k in ("insufficient", "not enough funds", "unaffordable", "could not afford",
+                                   "cannot afford")):
+        return "E_PAY_INSUFFICIENT_BALANCE"
+    if code in (205, 206) or any(k in combined for k in ("no route", "route not found", "failed to find route")):
+        return "E_PAY_NO_ROUTE"
+    if code == 207 or "expired" in combined:
+        return "E_PAY_EXPIRED"
+    if code == 210:
+        return "E_PAY_NO_ROUTE" if "route" in combined else "E_PAY_TIMEOUT"
+    if any(k in combined for k in ("timeout", "timed out")):
+        return "E_PAY_TIMEOUT"
+    if any(k in combined for k in ("incorrect", "unknown payment details")):
+        return "E_PAY_INCORRECT_DETAILS"
+    return "E_PAY_ERROR"
+
+
+def _pay_pending_item_via_node(deps, kind_arg, impl_arg, result):
+    """Pays the selected pending invoice via LND or Core Lightning with 3-step preflight and 1% fee cap,
+    then settles the item."""
+    with Lock(deps, wait=30):
+        pending = prune_pending(deps)
+        if kind_arg in ("order", "renewal", "reset"):
+            kind = kind_arg
+            item = pending.get(kind)
+        else:
+            kind, item = None, None
+            for k in ("order", "renewal", "reset"):
+                cand = pending.get(k)
+                if isinstance(cand, dict) and cand.get("state") == "awaiting_payment":
+                    kind, item = k, cand
+                    break
+            if item is None:
+                for k in ("order", "renewal", "reset"):
+                    cand = pending.get(k)
+                    if isinstance(cand, dict):
+                        kind, item = k, cand
+                        break
+        if not isinstance(item, dict) or not item.get("invoice"):
+            raise ModuleError("E_NO_PENDING", "not_configured",
+                              "no pending %s invoice to pay" % (kind_arg or "subscription"), EXIT_NOT_CONFIGURED)
+        result.fields["kind"] = kind
+        result.fields["payment_hash"] = item.get("payment_hash")
+        if item.get("state") in ("paid", "claiming"):
+            raise ModuleError("E_ALREADY_PAID", "refused",
+                              "this %s invoice is already marked paid: run settle" % kind, EXIT_REFUSED)
+        if item.get("state") == "needs_support":
+            raise ModuleError(item.get("error_code") or "E_CLAIM_INVALID", "invalid_response",
+                              item.get("error_detail") or "%s requires support" % kind, EXIT_INVALID_API)
+        np = item.get("node_payment") or {}
+        if np.get("state") in ("paying", "uncertain"):
+            raise ModuleError("E_PAY_IN_FLIGHT", "pay_failed",
+                              "a node payment for this %s is already in flight or uncertain: run settle first" % kind,
+                              EXIT_PAY_FAILED)
+        exp_dt = parse_iso(item.get("invoice_expires_at"))
+        if item.get("state") == "expired_unpaid" or (exp_dt is not None and deps.clock() >= exp_dt):
+            item["state"] = "expired_unpaid"
+            save_pending(deps, pending)
+            raise ModuleError("E_INVOICE_EXPIRED", "refused", "the %s invoice has expired" % kind, EXIT_REFUSED)
+        invoice = str(item.get("invoice") or "").strip()
+        payment_hash = str(item.get("payment_hash") or "").strip().lower()
+        decoded = verify_bolt11_invoice(invoice, payment_hash, expected_sats=item.get("amount_sats"),
+                                        max_sats=MAX_RENEW_SATS)
+        amount_sats = decoded["amount_sats"]
+        fee_limit_sats = max(int(math.ceil(amount_sats * 0.01)), 10)
+        fee_limit_msat = fee_limit_sats * 1000
+        state = load_state(deps)
+        conf = read_rb_conf(deps)
+        impl = (impl_arg or item.get("impl") or (state or {}).get("impl")
+                or conf.get("tunnelsatsImpl") or select_impl(conf)[0])
+        if impl not in IMPLS:
+            raise ModuleError("E_PAY_NODE_LOCKED", "pay_failed",
+                              "no active Lightning implementation (lnd or cl) available for node payment",
+                              EXIT_PAY_FAILED)
+
+        def fail_node_pay(code, msg, exit_code=EXIT_PAY_FAILED, cls="pay_failed", np_state="failed", np_result="failed"):
+            item["node_payment"] = {
+                "state": np_state,
+                "result": np_result,
+                "impl": impl,
+                "error_code": code,
+                "fee_limit_sats": fee_limit_sats,
+                "attempted_at": now_iso(deps),
+            }
+            save_pending(deps, pending)
+            result.fields.update({
+                "kind": kind,
+                "state": item.get("state"),
+                "payment_hash": payment_hash,
+                "amount_sats": amount_sats,
+                "fee_limit_sats": fee_limit_sats,
+                "node_payment": dict(item["node_payment"]),
+            })
+            raise ModuleError(code, cls, msg, exit_code)
+
+        # Preflight 1: Live API poll before paying (never pay twice)
+        if kind == "reset":
+            p_out, p_status, _p_doc, _p_det = poll_reset_status(deps, payment_hash)
+        else:
+            p_out, p_status, _p_doc, _p_det = poll_order_status(deps, payment_hash)
+        if p_out == "ok" and p_status in ("paid", "claimed", "processing"):
+            item["state"] = "paid"
+            save_pending(deps, pending)
+            raise ModuleError("E_ALREADY_PAID", "refused",
+                              "the TunnelSats API reports this %s invoice is already paid" % kind, EXIT_REFUSED)
+        if p_out == "ok" and p_status == "expired":
+            item["state"] = "expired_unpaid"
+            save_pending(deps, pending)
+            raise ModuleError("E_INVOICE_EXPIRED", "refused",
+                              "the TunnelSats API reports this %s invoice has expired" % kind, EXIT_REFUSED)
+        if p_out == "ok" and p_status == "failed":
+            item["state"] = "needs_support"
+            item["error_code"] = "E_RESET_FAILED" if kind == "reset" else "E_CLAIM_INVALID"
+            item["error_detail"] = "%s failed on server" % kind
+            save_pending(deps, pending)
+            raise ModuleError(item["error_code"], "invalid_response", item["error_detail"], EXIT_INVALID_API)
+
+        # Preflight 2: Node payment history check (listpayments / listpays)
+        if impl == "lnd":
+            rc, out, _err = deps.run(LNCLI + ["listpayments", "--include_incomplete"], timeout=30)
+            lp_doc = parse_one_json(out) if rc == 0 else None
+            if rc != 0 or not isinstance(lp_doc, dict):
+                fail_node_pay("E_PAY_NODE_LOCKED", "LND did not answer listpayments (wallet locked or unavailable)")
+            for p in lp_doc.get("payments") or []:
+                if not isinstance(p, dict) or str(p.get("payment_hash") or "").strip().lower() != payment_hash:
+                    continue
+                p_st = str(p.get("status") or "").upper()
+                if p_st == "SUCCEEDED":
+                    item["state"] = "paid"
+                    item["node_payment"] = {
+                        "state": "succeeded", "result": "succeeded", "impl": impl,
+                        "fee_limit_sats": fee_limit_sats, "paid_at": now_iso(deps),
+                    }
+                    save_pending(deps, pending)
+                    raise ModuleError("E_ALREADY_PAID", "refused", "LND already paid this invoice", EXIT_REFUSED)
+                if p_st in ("IN_FLIGHT", "INITIATED"):
+                    fail_node_pay("E_PAY_IN_FLIGHT",
+                                  "LND reports a payment for this invoice is already in flight",
+                                  np_state="uncertain", np_result="uncertain")
+        else:
+            rc, out, _err = deps.run(CLNCLI + ["listpays", "bolt11=" + invoice], timeout=30)
+            lp_doc = parse_one_json(out) if rc == 0 else None
+            if rc != 0 or not isinstance(lp_doc, dict):
+                fail_node_pay("E_PAY_NODE_LOCKED", "Core Lightning did not answer listpays (daemon unavailable)")
+            for p in lp_doc.get("pays") or []:
+                if not isinstance(p, dict):
+                    continue
+                p_hash = str(p.get("payment_hash") or "").strip().lower()
+                if p_hash and p_hash != payment_hash:
+                    continue
+                p_st = str(p.get("status") or "").lower()
+                if p_st == "complete":
+                    item["state"] = "paid"
+                    item["node_payment"] = {
+                        "state": "succeeded", "result": "succeeded", "impl": impl,
+                        "fee_limit_sats": fee_limit_sats, "paid_at": now_iso(deps),
+                    }
+                    save_pending(deps, pending)
+                    raise ModuleError("E_ALREADY_PAID", "refused",
+                                      "Core Lightning already paid this invoice", EXIT_REFUSED)
+                if p_st == "pending":
+                    fail_node_pay("E_PAY_IN_FLIGHT",
+                                  "Core Lightning reports a payment for this invoice is still pending",
+                                  np_state="uncertain", np_result="uncertain")
+
+        # Preflight 3: Node decode cross-check (decodepayreq / decode)
+        if impl == "lnd":
+            rc, out, _err = deps.run(LNCLI + ["decodepayreq", invoice], timeout=30)
+            dec_doc = parse_one_json(out) if rc == 0 else None
+            if rc != 0 or not isinstance(dec_doc, dict):
+                fail_node_pay("E_PAY_NODE_LOCKED", "LND did not answer decodepayreq (wallet locked or unavailable)")
+            node_hash = str(dec_doc.get("payment_hash") or "").strip().lower()
+            try:
+                node_sats = int(dec_doc.get("num_satoshis"))
+            except (TypeError, ValueError):
+                node_sats = -1
+            if node_hash != payment_hash or node_sats != amount_sats or node_sats <= 0 or node_sats > MAX_RENEW_SATS:
+                fail_node_pay("E_INVOICE_MISMATCH",
+                              "LND decodepayreq fields do not match the verified invoice",
+                              exit_code=EXIT_INVALID_API, cls="invalid_response")
+        else:
+            rc, out, _err = deps.run(CLNCLI + ["decode", invoice], timeout=30)
+            dec_doc = parse_one_json(out) if rc == 0 else None
+            if rc != 0 or not isinstance(dec_doc, dict):
+                fail_node_pay("E_PAY_NODE_LOCKED", "Core Lightning did not answer decode (daemon unavailable)")
+            node_hash = str(dec_doc.get("payment_hash") or "").strip().lower()
+            node_msat = _parse_msat(dec_doc.get("amount_msat"))
+            if (node_hash != payment_hash or node_msat != amount_sats * 1000
+                    or node_msat <= 0 or node_msat > MAX_RENEW_SATS * 1000):
+                fail_node_pay("E_INVOICE_MISMATCH",
+                              "Core Lightning decode fields do not match the verified invoice",
+                              exit_code=EXIT_INVALID_API, cls="invalid_response")
+
+        # Execute payment
+        item["node_payment"] = {
+            "state": "paying",
+            "result": "in_flight",
+            "impl": impl,
+            "fee_limit_sats": fee_limit_sats,
+            "attempted_at": now_iso(deps),
+        }
+        save_pending(deps, pending)
+
+        fee_sats = None
+        if impl == "lnd":
+            rc, out, err = deps.run(
+                LNCLI + ["payinvoice", "--force", "--json", "--timeout", "60s",
+                         "--fee_limit", str(fee_limit_sats), "--pay_req", invoice],
+                timeout=75,
+            )
+            pay_doc = _parse_last_json(out)
+            status_str = str((pay_doc or {}).get("status") or "").upper()
+            preimage = str((pay_doc or {}).get("payment_preimage") or "").strip().lower()
+            if isinstance(pay_doc, dict):
+                try:
+                    raw_fee = pay_doc.get("fee_sat") if pay_doc.get("fee_sat") is not None else pay_doc.get("fee")
+                    if raw_fee is not None:
+                        fee_sats = int(raw_fee)
+                except (TypeError, ValueError):
+                    fee_sats = None
+            if rc != 0 or status_str not in ("SUCCEEDED", "FAILED"):
+                l_rc, l_out, _l_err = deps.run(LNCLI + ["listpayments", "--include_incomplete"], timeout=30)
+                l_doc = parse_one_json(l_out) if l_rc == 0 else None
+                if isinstance(l_doc, dict):
+                    for p in reversed(l_doc.get("payments") or []):
+                        if isinstance(p, dict) and str(p.get("payment_hash") or "").strip().lower() == payment_hash:
+                            p_st = str(p.get("status") or "").upper()
+                            if p_st in ("SUCCEEDED", "FAILED", "IN_FLIGHT", "INITIATED"):
+                                status_str = p_st
+                                preimage = str(p.get("payment_preimage") or preimage).strip().lower()
+                                if p.get("failure_reason"):
+                                    if isinstance(pay_doc, dict) and not pay_doc.get("failure_reason"):
+                                        pay_doc["failure_reason"] = p.get("failure_reason")
+                                    elif pay_doc is None:
+                                        pay_doc = {"failure_reason": p.get("failure_reason")}
+                                try:
+                                    raw_fee = p.get("fee_sat") if p.get("fee_sat") is not None else p.get("fee")
+                                    if raw_fee is not None:
+                                        fee_sats = int(raw_fee)
+                                except (TypeError, ValueError):
+                                    pass
+                            break
+            if status_str == "SUCCEEDED":
+                if not _verify_preimage(preimage, payment_hash):
+                    fail_node_pay("E_PAY_ERROR", "LND reported SUCCEEDED without a matching payment preimage")
+            elif status_str in ("IN_FLIGHT", "INITIATED") or rc == 124:
+                fail_node_pay("E_PAY_TIMEOUT",
+                              "LND payment timed out or remains in flight; check status with settle",
+                              np_state="uncertain", np_result="uncertain")
+            else:
+                err_code = _map_lnd_pay_error(pay_doc, out, err)
+                fail_node_pay(err_code, "LND payment failed (%s)" % err_code)
+        else:
+            rc, out, err = deps.run(
+                CLNCLI + ["-k", "pay", "bolt11=" + invoice,
+                          "maxfee=%dmsat" % fee_limit_msat, "retry_for=60"],
+                timeout=75,
+            )
+            pay_doc = _parse_last_json(out) or _parse_last_json(err)
+            status_str = str((pay_doc or {}).get("status") or "").lower()
+            preimage = str((pay_doc or {}).get("payment_preimage") or "").strip().lower()
+            if isinstance(pay_doc, dict):
+                sent_m = _parse_msat(pay_doc.get("amount_sent_msat"))
+                amt_m = _parse_msat(pay_doc.get("amount_msat"))
+                if sent_m is not None and amt_m is not None and sent_m >= amt_m:
+                    fee_sats = (sent_m - amt_m) // 1000
+            if rc != 0 or status_str != "complete":
+                l_rc, l_out, _l_err = deps.run(CLNCLI + ["listpays", "bolt11=" + invoice], timeout=30)
+                l_doc = parse_one_json(l_out) if l_rc == 0 else None
+                if isinstance(l_doc, dict):
+                    for p in reversed(l_doc.get("pays") or []):
+                        if isinstance(p, dict):
+                            p_st = str(p.get("status") or "").lower()
+                            if p_st == "complete":
+                                status_str = "complete"
+                                preimage = str(p.get("preimage") or p.get("payment_preimage") or preimage).strip().lower()
+                                break
+                            if p_st == "pending":
+                                status_str = "pending"
+                                break
+            if status_str == "complete":
+                if not _verify_preimage(preimage, payment_hash):
+                    fail_node_pay("E_PAY_ERROR",
+                                  "Core Lightning reported complete without a matching payment preimage")
+            elif status_str == "pending" or rc == 124:
+                fail_node_pay("E_PAY_TIMEOUT",
+                              "Core Lightning payment timed out or remains pending; check status with settle",
+                              np_state="uncertain", np_result="uncertain")
+            else:
+                err_code = _map_cln_pay_error(pay_doc, out, err)
+                fail_node_pay(err_code, "Core Lightning payment failed (%s)" % err_code)
+
+        item["state"] = "paid"
+        item["node_payment"] = {
+            "state": "succeeded",
+            "result": "succeeded",
+            "impl": impl,
+            "fee_limit_sats": fee_limit_sats,
+            "fee_sats": fee_sats,
+            "preimage_verified": True,
+            "paid_at": now_iso(deps),
+        }
+        save_pending(deps, pending)
+        node_payment_snapshot = dict(item["node_payment"])
+        result.fields.update({
+            "kind": kind,
+            "state": "paid",
+            "payment_hash": payment_hash,
+            "amount_sats": amount_sats,
+            "fee_limit_sats": fee_limit_sats,
+            "node_payment": node_payment_snapshot,
+        })
+
+    outcome = settle_once(deps, result, foreground=True, use_lock=True)
+    result.fields.update({k: v for k, v in outcome.items() if k != "done"})
+    result.fields["amount_sats"] = amount_sats
+    result.fields["fee_limit_sats"] = fee_limit_sats
+    result.fields["node_payment"] = node_payment_snapshot
+    if outcome.get("done"):
+        if outcome.get("state") == "confirmed":
+            result.exit_code = EXIT_OK
+        hide_qr(deps)
+    else:
+        result.exit_code = EXIT_PENDING
+
+
+def cmd_pay_node(deps, args, result):
+    if not getattr(args, "yes", False):
+        raise ModuleError("E_CONFIRMATION_REQUIRED", "usage",
+                          "pay-node requires --yes", EXIT_USAGE)
+    if getattr(args, "kind", None) not in (None, "order", "renewal", "reset"):
+        raise ModuleError("E_USAGE", "usage", "--kind must be order, renewal, or reset", EXIT_USAGE)
+    _pay_pending_item_via_node(deps, getattr(args, "kind", None), getattr(args, "impl", None), result)
 
 
 # ------------------------------------------------------------------------------------------
@@ -2607,7 +3374,7 @@ def lightning_info(deps, impl):
     if impl == "lnd":
         argv = LNCLI + ["getinfo"]
     else:
-        argv = ["sudo", "-u", "bitcoin", "/usr/local/bin/lightning-cli", "--conf=/home/bitcoin/.lightning/config", "getinfo"]
+        argv = CLNCLI + ["getinfo"]
     rc, out, _err = deps.run(argv, timeout=30)
     return parse_one_json(out) if rc == 0 else None
 
@@ -3693,7 +4460,7 @@ def cmd_tick(deps, args, result):
 
         if not is_test_hook:
             pending = load_pending(deps)
-            if pending.get("order") or pending.get("renewal") or pending.get("retained_orders"):
+            if pending.get("order") or pending.get("renewal") or pending.get("reset") or pending.get("retained_orders"):
                 def on_settle_notify(ev, cycle_key):
                     nonlocal state_dirty
                     entry = send_event_notification(deps, conf, nstate, ev, cycle_key, now_dt=now_dt)
@@ -3902,9 +4669,13 @@ def menu_choices(deps, state, conf, found=None):
         remove = ("REMOVE", "Remove again: check the config, then start Lightning")
     choices = [("STATUS", "Subscription and tunnel status"), ("CHECK", "Connection check")]
     if not has_remove_pending:
-        choices.append(("RENEW", "Extend the current subscription"))
-        if pending_store.get("renewal"):
-            choices.append(("RESUME", "Resume pending renewal"))
+        choices.extend([
+            ("RENEW", "Extend the current subscription"),
+            ("TOPUP", "Reset monthly bandwidth usage"),
+            ("BACKUP", "Export WireGuard config (.conf) backup"),
+        ])
+        if pending_store.get("renewal") or pending_store.get("reset"):
+            choices.append(("RESUME", "Resume pending renewal or bandwidth reset"))
         if state.get("activation_pending"):
             choices.append(("ACTIVATE", "Finish activating claimed subscription"))
     if state.get("mode") == "adopted_legacy":
@@ -3988,6 +4759,44 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
     d.set_background_title("TunnelSats VPN")
     found = None
     duration_choices = [("1", "1 month"), ("3", "3 months"), ("6", "6 months"), ("12", "12 months")]
+    pay_choices = [
+        ("QR", "Show QR code and BOLT11 invoice (external wallet)"),
+        ("NODE", "Pay from this RaspiBlitz node (1% routing fee cap)"),
+    ]
+
+    def handle_invoice_payment(kind, title):
+        inv_doc = menu_run(deps, ["invoice", "--kind", kind])
+        if not inv_doc.get("invoice"):
+            d.msgbox(result_text(inv_doc), title=title, width=78, height=20)
+            return
+        amt = int(inv_doc.get("amount_sats") or 0)
+        fee_cap = max(int(math.ceil(amt * 0.01)), 10)
+        code_p, pay_tag = d.menu(
+            "Invoice amount: %d sats\nChoose how to pay:" % amt,
+            choices=pay_choices, width=70, height=12, title=title,
+        )
+        if code_p != d.OK:
+            return
+        if pay_tag == "NODE":
+            if d.yesno("Pay %d sats from this node (max routing fee %d sats)?" % (amt, fee_cap),
+                       width=64, height=10, title=title) == d.OK:
+                os.system("clear")
+                print("# TunnelSats: paying %d sats via local node ..." % amt)
+                pay_doc = menu_run(deps, ["pay-node", "--kind", kind, "--yes"])
+                if pay_doc["ok"]:
+                    d.msgbox(result_text(pay_doc), title=title, width=78, height=20)
+                    return
+                if d.yesno(result_text(pay_doc) + "\n\nShow QR code to pay with an external wallet instead?",
+                           width=78, height=18, title=title) != d.OK:
+                    return
+        os.system("clear")
+        show_qr(deps, inv_doc["invoice"])
+        print("\nBOLT11: %s\n" % inv_doc["invoice"])
+        print("# Waiting for payment (up to 5 minutes; background timer also settles automatically) ...")
+        settle_doc = menu_run(deps, ["settle", "--wait", "300"])
+        hide_qr(deps)
+        d.msgbox(result_text(settle_doc), title=title, width=78, height=20)
+
     while True:
         state = load_state(deps)
         conf = read_rb_conf(deps)
@@ -3999,7 +4808,7 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
         text = "\nTunnelSats VPN for Lightning clearnet:"
         if notice:
             text = "\n%s\n%s" % (notice, text)
-        code, tag = d.menu(text, choices=choices, width=78 if notice else 70, height=28 if notice else 16,
+        code, tag = d.menu(text, choices=choices, width=78 if notice else 70, height=28 if notice else 18,
                            title="TunnelSats", cancel_label="Back")
         if code != d.OK:
             return
@@ -4022,18 +4831,11 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
                 continue
             os.system("clear")
             print("# TunnelSats: creating subscription invoice ...")
-            doc = menu_run(deps, ["buy", "--server", server_id, "--months", months, "--pay", "qr"])
+            doc = menu_run(deps, ["buy", "--server", server_id, "--months", months, "--pay", "none"])
             if not doc["ok"]:
                 d.msgbox(result_text(doc), title="BUY", width=78, height=20)
                 continue
-            inv_doc = menu_run(deps, ["invoice", "--kind", "order"])
-            if inv_doc.get("invoice"):
-                show_qr(deps, inv_doc["invoice"])
-                print("\nBOLT11: %s\n" % inv_doc["invoice"])
-                print("# Waiting for payment (up to 5 minutes; background timer also settles automatically) ...")
-                settle_doc = menu_run(deps, ["settle", "--wait", "300"])
-                hide_qr(deps)
-                d.msgbox(result_text(settle_doc), title="BUY", width=78, height=20)
+            handle_invoice_payment("order", "BUY")
         elif tag == "RENEW":
             code, months = d.menu("Choose renewal duration:", choices=duration_choices,
                                   width=60, height=12, title="RENEW")
@@ -4041,30 +4843,36 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
                 continue
             os.system("clear")
             print("# TunnelSats: creating renewal invoice ...")
-            doc = menu_run(deps, ["renew", "--months", months, "--pay", "qr"])
+            doc = menu_run(deps, ["renew", "--months", months, "--pay", "none"])
             if not doc["ok"]:
                 d.msgbox(result_text(doc), title="RENEW", width=78, height=20)
                 continue
-            inv_doc = menu_run(deps, ["invoice", "--kind", "renewal"])
-            if inv_doc.get("invoice"):
-                show_qr(deps, inv_doc["invoice"])
-                print("\nBOLT11: %s\n" % inv_doc["invoice"])
-                print("# Waiting for payment (up to 5 minutes) ...")
-                settle_doc = menu_run(deps, ["settle", "--wait", "300"])
-                hide_qr(deps)
-                d.msgbox(result_text(settle_doc), title="RENEW", width=78, height=20)
+            handle_invoice_payment("renewal", "RENEW")
+        elif tag == "TOPUP":
+            os.system("clear")
+            print("# TunnelSats: creating bandwidth reset invoice ...")
+            doc = menu_run(deps, ["topup", "--pay", "none"])
+            if not doc["ok"]:
+                d.msgbox(result_text(doc), title="TOPUP", width=78, height=20)
+                continue
+            handle_invoice_payment("reset", "TOPUP")
+        elif tag == "BACKUP":
+            code, out_path = d.inputbox("Path to write the WireGuard config backup (0600 admin):",
+                                        init="/home/admin/tunnelsats-backup.conf",
+                                        width=70, height=10, title="BACKUP")
+            if code != d.OK or not out_path.strip():
+                continue
+            doc = menu_run(deps, ["export", "--out", out_path.strip()])
+            d.msgbox(result_text(doc), title="BACKUP", width=78, height=20)
         elif tag == "RESUME":
             pending_store = load_pending(deps)
-            kind = "order" if (pending_store.get("order") or pending_store.get("retained_orders")) else "renewal"
-            inv_doc = menu_run(deps, ["invoice", "--kind", kind])
-            if inv_doc.get("invoice"):
-                os.system("clear")
-                show_qr(deps, inv_doc["invoice"])
-                print("\nBOLT11: %s\n" % inv_doc["invoice"])
-                print("# Checking and waiting for settlement ...")
-            settle_doc = menu_run(deps, ["settle", "--wait", "300"])
-            hide_qr(deps)
-            d.msgbox(result_text(settle_doc), title="RESUME", width=78, height=20)
+            if pending_store.get("order") or pending_store.get("retained_orders"):
+                kind = "order"
+            elif pending_store.get("renewal"):
+                kind = "renewal"
+            else:
+                kind = "reset"
+            handle_invoice_payment(kind, "RESUME")
         elif tag == "ACTIVATE":
             os.system("clear")
             print("# TunnelSats: activating claimed subscription ...")
@@ -4183,10 +4991,10 @@ def status_text(doc):
 # ------------------------------------------------------------------------------------------
 
 HANDLERS = {"menu": cmd_menu, "servers": cmd_servers, "buy": cmd_buy, "renew": cmd_renew,
-            "invoice": cmd_invoice, "pending": cmd_pending, "settle": cmd_settle,
-            "import": cmd_import, "adopt": cmd_adopt, "status": cmd_status, "check": cmd_check,
-            "detect": cmd_detect, "repair": cmd_repair, "uninstall": cmd_uninstall,
-            "subscriptions-list": cmd_subscriptions_list, "tick": cmd_tick}
+            "topup": cmd_topup, "invoice": cmd_invoice, "pending": cmd_pending, "settle": cmd_settle,
+            "pay-node": cmd_pay_node, "export": cmd_export, "import": cmd_import, "adopt": cmd_adopt,
+            "status": cmd_status, "check": cmd_check, "detect": cmd_detect, "repair": cmd_repair,
+            "uninstall": cmd_uninstall, "subscriptions-list": cmd_subscriptions_list, "tick": cmd_tick}
 
 
 class _UsageError(Exception):
@@ -4216,15 +5024,28 @@ def build_parser():
     p.add_argument("--months", type=int, choices=DURATIONS, required=True)
     p.add_argument("--pay", choices=PAY_MODES, default="none")
     p.add_argument("--impl", choices=IMPLS)
+    p.add_argument("--yes", action="store_true")
     p = verb("renew")
     p.add_argument("--months", type=int, choices=DURATIONS, required=True)
     p.add_argument("--pay", choices=PAY_MODES, default="none")
+    p.add_argument("--impl", choices=IMPLS)
+    p.add_argument("--yes", action="store_true")
+    p = verb("topup")
+    p.add_argument("--pay", choices=PAY_MODES, default="none")
+    p.add_argument("--impl", choices=IMPLS)
+    p.add_argument("--yes", action="store_true")
     p = verb("invoice")
     p.add_argument("--kind", choices=("order", "renewal", "reset"), default="order")
     p.add_argument("--qr-png")
     verb("pending")
     p = verb("settle")
     p.add_argument("--wait", type=int, default=0)
+    p = verb("pay-node")
+    p.add_argument("--kind", choices=("order", "renewal", "reset"))
+    p.add_argument("--impl", choices=IMPLS)
+    p.add_argument("--yes", action="store_true")
+    p = verb("export")
+    p.add_argument("--out", required=True)
     p = verb("import")
     p.add_argument("--file", required=True)
     p.add_argument("--impl", choices=IMPLS)
