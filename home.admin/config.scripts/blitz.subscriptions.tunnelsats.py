@@ -107,14 +107,17 @@ DURATIONS = (1, 3, 6, 12)
 PAY_MODES = ("node", "qr", "copy", "none")
 
 OFFLINE_SERVERS = (
-    {"id": "eu-de", "country": "Germany", "city": "Frankfurt", "flag": "DE", "status": "active"},
-    {"id": "eu-nl", "country": "Netherlands", "city": "Amsterdam", "flag": "NL", "status": "active"},
-    {"id": "eu-ch", "country": "Switzerland", "city": "Zurich", "flag": "CH", "status": "active"},
-    {"id": "us-east", "country": "USA", "city": "Ashburn", "flag": "US", "status": "active"},
-    {"id": "us-west", "country": "USA", "city": "Los Angeles", "flag": "US", "status": "active"},
-    {"id": "ca-east", "country": "Canada", "city": "Montreal", "flag": "CA", "status": "active"},
-    {"id": "ap-sg", "country": "Singapore", "city": "Singapore", "flag": "SG", "status": "active"},
+    {"id": "us-east", "country": "USA", "city": "Ashburn", "flag": "🇺🇸", "status": "online"},
+    {"id": "us-west", "country": "USA", "city": "Hillsboro", "flag": "🇺🇸", "status": "online"},
+    {"id": "eu-de", "country": "Germany", "city": "Nuremberg", "flag": "🇩🇪", "status": "online"},
+    {"id": "asia-sg", "country": "Singapore", "city": "Singapore", "flag": "🇸🇬", "status": "online"},
+    {"id": "sa-br", "country": "Brazil", "city": "Sao Paulo", "flag": "🇧🇷", "status": "online"},
+    {"id": "oc-au", "country": "Australia", "city": "Sydney", "flag": "🇦🇺", "status": "online"},
+    {"id": "eu-ch", "country": "Switzerland", "city": "Geneva", "flag": "🇨🇭", "status": "online"},
 )
+SERVER_STATUSES = ("online", "degraded", "offline", "active", "full", "maintenance", "disabled")
+ONLINE_SERVER_STATUSES = ("online", "active")
+SELECTABLE_SERVER_STATUSES = ("online", "degraded", "active")
 
 # Timeouts (s) for internet.tunnelsats.sh, each above the script's own worst case, so the script
 # ends by itself and cleans up; run_command stops the whole process group only as a last resort.
@@ -1186,6 +1189,38 @@ def cmd_detect(deps, args, result):
 # servers
 # ------------------------------------------------------------------------------------------
 
+def _validate_server_items(items):
+    if not isinstance(items, list) or not items:
+        return None
+    servers = []
+    seen = set()
+    for entry in items:
+        if not isinstance(entry, dict):
+            return None
+        sid = entry.get("id")
+        country = entry.get("country")
+        city = entry.get("city")
+        flag = entry.get("flag") or ""
+        status = entry.get("status") or "online"
+        if not isinstance(sid, str) or not SERVER_ID_RE.fullmatch(sid) or sid in seen:
+            return None
+        if not isinstance(country, str) or not country.strip() or len(country) > 64 \
+                or any(ord(c) < 32 or ord(c) == 127 for c in country):
+            return None
+        if not isinstance(city, str) or not city.strip() or len(city) > 64 \
+                or any(ord(c) < 32 or ord(c) == 127 for c in city):
+            return None
+        if not isinstance(flag, str) or len(flag) > 16 \
+                or any(ord(c) < 32 or ord(c) == 127 for c in flag):
+            return None
+        if status not in SERVER_STATUSES:
+            return None
+        seen.add(sid)
+        servers.append({"id": sid, "country": country.strip(), "city": city.strip(),
+                        "flag": flag.strip(), "status": status})
+    return servers
+
+
 def _validate_servers_payload(raw):
     if not raw or len(raw) > API_MAX_BYTES:
         return None
@@ -1194,39 +1229,19 @@ def _validate_servers_payload(raw):
     except ValueError:
         return None
     items = parsed.get("servers") if isinstance(parsed, dict) else parsed
-    if not isinstance(items, list) or not items:
-        return None
-    servers = []
-    for entry in items:
-        if not isinstance(entry, dict):
-            return None
-        sid = entry.get("id")
-        country = entry.get("country")
-        city = entry.get("city")
-        flag = entry.get("flag") or ""
-        status = entry.get("status") or "active"
-        if not isinstance(sid, str) or not SERVER_ID_RE.fullmatch(sid):
-            return None
-        if not isinstance(country, str) or not country.strip() or len(country) > 64:
-            return None
-        if not isinstance(city, str) or not city.strip() or len(city) > 64:
-            return None
-        if not isinstance(flag, str) or len(flag) > 16:
-            return None
-        if status not in ("active", "full", "maintenance", "disabled"):
-            return None
-        servers.append({"id": sid, "country": country.strip(), "city": city.strip(),
-                        "flag": flag.strip(), "status": status})
-    return servers
+    return _validate_server_items(items)
 
 
 def _load_servers_cache(deps):
     try:
         with open(deps.path(SERVERS_CACHE_FILE), encoding="utf-8") as handle:
             doc = json.load(handle)
-        if not isinstance(doc, dict) or not isinstance(doc.get("servers"), list) or not doc["servers"]:
+        if not isinstance(doc, dict):
             return None, None
-        return doc["servers"], parse_iso(doc.get("fetched_at"))
+        servers = _validate_server_items(doc.get("servers"))
+        if not servers:
+            return None, None
+        return servers, parse_iso(doc.get("fetched_at"))
     except (OSError, ValueError):
         return None, None
 
@@ -4740,6 +4755,29 @@ def pending_removal_text(deps, pending):
     return text + "\nThen choose REMOVE again: %s." % then
 
 
+def menu_server_choices(servers):
+    """Builds (server_id, label) choices for the TUI BUY dialog from a servers list.
+    Includes online and degraded servers; marks degraded servers in the label and excludes offline ones."""
+    choices = []
+    for s in servers or ():
+        if not isinstance(s, dict):
+            continue
+        status = s.get("status")
+        if status not in SELECTABLE_SERVER_STATUSES:
+            continue
+        sid = s.get("id")
+        country = (s.get("country") or "").strip()
+        city = (s.get("city") or "").strip()
+        flag = (s.get("flag") or "").strip()
+        if not sid or not country or not city:
+            continue
+        label = "%s %s - %s" % (flag, country, city) if flag else "%s - %s" % (country, city)
+        if status not in ONLINE_SERVER_STATUSES:
+            label += " [%s]" % status
+        choices.append((sid, label))
+    return choices
+
+
 def menu_start(deps, restart=False):
     """START and RESTART of the menu, only while TunnelSats is on (see menu_choices). Returns the
     implementation it started, or None if TunnelSats is off."""
@@ -4816,8 +4854,8 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
             d.msgbox(ABOUT_TEXT, title="About TunnelSats", width=80, height=22)
         elif tag == "BUY":
             srv_doc = menu_run(deps, ["servers"])
-            srv_choices = [(s["id"], "%s %s - %s" % (s.get("flag", ""), s["country"], s["city"]))
-                           for s in (srv_doc.get("servers") or []) if s.get("status") == "active"]
+            srv_list = srv_doc.get("servers") or []
+            srv_choices = menu_server_choices(srv_list)
             if not srv_choices:
                 d.msgbox("No active TunnelSats servers available right now.", title="BUY", width=60, height=8)
                 continue
@@ -4825,6 +4863,13 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
                                      width=70, height=16, title="BUY")
             if code != d.OK:
                 continue
+            selected_srv = next((s for s in srv_list if isinstance(s, dict) and s.get("id") == server_id), None)
+            if selected_srv and selected_srv.get("status") not in ONLINE_SERVER_STATUSES:
+                if d.yesno("Server %s (%s - %s) currently has status '%s'.\n\nContinue anyway?"
+                           % (server_id, selected_srv.get("country", ""), selected_srv.get("city", ""),
+                              selected_srv.get("status", "unknown")),
+                           width=64, height=10, title="BUY") != d.OK:
+                    continue
             code, months = d.menu("Choose subscription duration:", choices=duration_choices,
                                   width=60, height=12, title="BUY")
             if code != d.OK:

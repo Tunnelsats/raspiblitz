@@ -2592,30 +2592,75 @@ class TestPendingStore(ModuleTestCase):
 
 class TestServers(ModuleTestCase):
     def test_live_servers_cache_and_offline_fallback(self):
-        live = [{"id": "de2", "country": "Germany", "city": "Frankfurt", "flag": "DE", "status": "active"},
-                {"id": "us-east1", "country": "United States", "city": "Ashburn", "flag": "US", "status": "active"}]
-        self.fake.http_responses = [(200, {}, json.dumps({"servers": live}).encode())]
+        live_raw = fixture("api", "servers.json", mode="rb")
+        expected_servers = fixture_json("api", "servers.json")["servers"]
+        self.assertEqual(expected_servers, list(mod.OFFLINE_SERVERS))
+        self.fake.http_responses = [(200, {}, live_raw)]
         doc = self.run_verb("servers")
-        self.assertEqual((0, False, False, 2), (doc["exit_code"], doc["stale"], doc["offline_list"], len(doc["servers"])))
+        self.assertEqual((0, False, False, 7), (doc["exit_code"], doc["stale"], doc["offline_list"], len(doc["servers"])))
+        self.assertEqual(expected_servers, doc["servers"])
         self.assertEqual([(mod.API_SERVERS_URL, None)], self.fake.http_calls)
 
         # Within 60s cache window: returns fresh cache without HTTP call
         self.fake.http_calls.clear()
         doc2 = self.run_verb("servers")
-        self.assertEqual(([], False, False, 2), (self.fake.http_calls, doc2["stale"], doc2["offline_list"], len(doc2["servers"])))
+        self.assertEqual(([], False, False, 7), (self.fake.http_calls, doc2["stale"], doc2["offline_list"], len(doc2["servers"])))
 
         # Advance clock past 60s and make API fail: falls back to stale cache (offline_list=False)
         self.deps.clock = lambda: NOW + datetime.timedelta(seconds=120)
         self.fake.http_responses = [OSError("network down")]
         doc3 = self.run_verb("servers")
-        self.assertEqual((True, False, 2), (doc3["stale"], doc3["offline_list"], len(doc3["servers"])))
+        self.assertEqual((True, False, 7), (doc3["stale"], doc3["offline_list"], len(doc3["servers"])))
 
         # Remove cache file and make API return invalid server ID: falls back to static offline list
         os.unlink(self.path(mod.SERVERS_CACHE_FILE))
-        self.fake.http_responses = [(200, {}, json.dumps([{"id": "BAD_ID!", "status": "active"}]).encode())]
+        self.fake.http_responses = [(200, {}, json.dumps([{"id": "BAD_ID!", "status": "online"}]).encode())]
         doc4 = self.run_verb("servers")
         self.assertEqual((True, True, len(mod.OFFLINE_SERVERS)),
                          (doc4["stale"], doc4["offline_list"], len(doc4["servers"])))
+        self.assertEqual(expected_servers, doc4["servers"])
+
+    def test_servers_validation_and_menu_server_choices(self):
+        # Optional Server schema fields (domain, upptimeId, hasDualKeySupport) are stripped to allow-listed keys
+        with_optional = {
+            "servers": [
+                {"id": "eu-de", "country": "Germany", "city": "Nuremberg", "flag": "🇩🇪", "status": "online",
+                 "domain": "de2.tunnelsats.com", "upptimeId": "de2", "hasDualKeySupport": True},
+                {"id": "us-west", "country": "USA", "city": "Hillsboro", "flag": "🇺🇸", "status": "degraded"},
+                {"id": "eu-ch", "country": "Switzerland", "city": "Geneva", "flag": "🇨🇭", "status": "offline"},
+            ]
+        }
+        parsed = mod._validate_servers_payload(json.dumps(with_optional).encode())
+        self.assertIsNotNone(parsed)
+        self.assertEqual(["eu-de", "us-west", "eu-ch"], [s["id"] for s in parsed])
+        self.assertEqual({"id", "country", "city", "flag", "status"}, set(parsed[0].keys()))
+
+        # Menu choices include online and degraded (marked [degraded]) and exclude offline
+        choices = mod.menu_server_choices(parsed)
+        self.assertEqual([
+            ("eu-de", "🇩🇪 Germany - Nuremberg"),
+            ("us-west", "🇺🇸 USA - Hillsboro [degraded]"),
+        ], choices)
+
+        # Duplicate server IDs, control characters, and unknown statuses are rejected
+        for bad in (
+            [{"id": "eu-de", "country": "Germany", "city": "Nuremberg", "status": "online"},
+             {"id": "eu-de", "country": "Germany", "city": "Nuremberg", "status": "online"}],
+            [{"id": "eu-de", "country": "Germany\n", "city": "Nuremberg", "status": "online"}],
+            [{"id": "eu-de", "country": "Germany", "city": "Nuremberg\x00", "status": "online"}],
+            [{"id": "eu-de", "country": "Germany", "city": "Nuremberg", "flag": "\x1b[31m", "status": "online"}],
+            [{"id": "eu-de", "country": "Germany", "city": "Nuremberg", "status": "unknown_state"}],
+        ):
+            self.assertIsNone(mod._validate_servers_payload(json.dumps({"servers": bad}).encode()))
+
+        # Corrupted cache file is ignored and refetched from API
+        os.makedirs(self.path(mod.LOCK_DIR), mode=0o700, exist_ok=True)
+        with open(self.path(mod.SERVERS_CACHE_FILE), "w", encoding="utf-8") as handle:
+            json.dump({"fetched_at": mod.now_iso(self.deps),
+                       "servers": [{"id": "../bad", "country": "X", "city": "Y", "status": "online"}]}, handle)
+        self.fake.http_responses = [(200, {}, fixture("api", "servers.json", mode="rb"))]
+        doc = self.run_verb("servers")
+        self.assertEqual((False, False, 7), (doc["stale"], doc["offline_list"], len(doc["servers"])))
 
 
 # ------------------------------------------------------------------------------------------
