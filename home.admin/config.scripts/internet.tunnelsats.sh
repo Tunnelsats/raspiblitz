@@ -20,8 +20,8 @@
 # ---------------------------------------------------------------------------------------------
 
 TS_PIN_VERSION="3.2"
-# web-flow signed squash merge on Tunnelsats/tunnelsats main (its PR 233, on top of PR 230 and PR 227)
-TS_PIN_COMMIT="36513ae7ca6685aaaad486d9a88baff2716a0a2d"
+# web-flow signed squash merge on Tunnelsats/tunnelsats main (PR 237, on top of PR 233, PR 230 and PR 227)
+TS_PIN_COMMIT="24b184620a715825148cf50d0e537870943d1a94"
 TS_PIN_SHA256="b1c0998c70dcaab6928120250d249f775d24c5f736abc24e611591126f67d048"
 TS_PIN_SIGNER="web-flow"
 TS_PIN_KEY_URL="https://github.com/web-flow.gpg"
