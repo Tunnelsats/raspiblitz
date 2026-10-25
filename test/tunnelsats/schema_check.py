@@ -22,12 +22,18 @@ _TYPES = {
 }
 
 
+def _same_value(actual, expected):
+    if isinstance(actual, bool) != isinstance(expected, bool):
+        return False
+    return actual == expected
+
+
 def validate(value, schema, path="$"):
     """Returns a list of error strings (empty when the value matches)."""
     errors = []
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _same_value(value, schema["const"]):
         errors.append(f"{path}: expected {schema['const']!r}")
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_same_value(value, item) for item in schema["enum"]):
         errors.append(f"{path}: {value!r} not in {schema['enum']!r}")
     if "type" in schema:
         types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]

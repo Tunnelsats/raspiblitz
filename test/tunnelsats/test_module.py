@@ -3473,6 +3473,30 @@ class TestExportAndMenuP4(ModuleTestCase):
         self.assertIn("BACKUP", tags)
 
 
+class TestSchemaCheck(unittest.TestCase):
+    def test_const_and_enum_distinguish_booleans_from_numbers(self):
+        base = {
+            "contract": 1,
+            "command": "status",
+            "module_version": "0.1.0",
+            "ok": True,
+            "exit_code": 0,
+            "errors": [],
+        }
+        self.assertEqual([], schema_check.validate(base, ENVELOPE))
+        self.assertEqual(["$.contract: expected 1"], schema_check.validate({**base, "contract": True}, ENVELOPE))
+        self.assertEqual(
+            ["$.exit_code: False not in [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14]"],
+            schema_check.validate({**base, "exit_code": False}, ENVELOPE),
+        )
+        self.assertEqual(
+            ["$.exit_code: True not in [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14]"],
+            schema_check.validate({**base, "exit_code": True}, ENVELOPE),
+        )
+        self.assertEqual(["$: expected True"], schema_check.validate(1, {"const": True}))
+        self.assertEqual(["$: 0 not in [False, True]"], schema_check.validate(0, {"enum": [False, True]}))
+
+
 if __name__ == "__main__":
     unittest.main()
 
